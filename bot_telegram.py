@@ -1,5 +1,7 @@
 import os
 import requests
+import re
+from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 
 def scrape_lich_hoc_to_image():
@@ -12,7 +14,6 @@ def scrape_lich_hoc_to_image():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Thiết lập kích thước màn hình siêu rộng để bảng lịch học không bị co dúm
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
 
@@ -32,34 +33,56 @@ def scrape_lich_hoc_to_image():
             page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
             print("🔍 BƯỚC 5: Chuyển sang tab Bảng và chọn tuần hiện tại...")
-            page.wait_for_timeout(5000) # Đợi web load khung ngoài
+            page.wait_for_timeout(5000) 
             page.click('a:has-text("Bảng")')
+            page.wait_for_timeout(2000)
             
-            # --- ĐOẠN CODE MỚI: CHỌN TUẦN HIỆN TẠI ---
-            # Web trường thường có nút "Tuần này" hoặc một dropdown menu để chọn tuần.
-            # Bạn hãy kiểm tra trên web trường xem có nút nào tên là "Tuần này" không nhé.
-            
-            # GIẢ SỬ WEB CÓ NÚT "TUẦN NÀY":
+            # --- BỘ NÃO TÌM TUẦN HIỆN TẠI ---
+            print("🧠 Bot đang tính toán ngày tháng để chọn đúng tuần...")
             try:
-                # Tìm và click vào nút có chữ "Tuần này". 
-                # Nếu web trường không có nút này, bạn hãy thay bằng ID hoặc Selector của ô chọn tuần.
-                print("⏳ Đang tìm và bấm nút 'Tuần này'...")
-                # selector phổ biến: text="Tuần này" hoặc .btn-current-week
-                page.click('button:has-text("Tuần này")')
-                # Sau khi click, cho web nghỉ 3 giây để vẽ lại bảng mới
-                page.wait_for_timeout(3000)
-                print("✅ Đã chọn xong tuần hiện tại.")
-            except Exception:
-                # Nếu không tìm thấy nút, in ra cảnh báo nhưng vẫn tiếp tục để chụp ảnh (có thể bị sai tuần)
-                print("⚠️ Cảnh báo: Không tìm thấy nút 'Tuần này'. Bot sẽ chụp tuần mặc định.")
-            # ----------------------------------------
+                # 1. Bấm vào cái ô chọn tuần để nó sổ danh sách ra
+                page.click('.ui-select-match')
+                page.wait_for_selector('.ui-select-choices-row', timeout=5000)
+                
+                # 2. Lấy thời gian hiện tại ở Việt Nam
+                vn_tz = timezone(timedelta(hours=7))
+                today = datetime.now(vn_tz)
+                
+                # 3. Đọc từng tuần và tìm xem hôm nay nằm ở tuần nào
+                rows = page.locator('.ui-select-choices-row').all()
+                found_week = False
+                
+                for row in rows:
+                    text = row.inner_text()
+                    # Tìm cái đoạn ngày tháng kiểu (1/9/2025 - 7/9/2025)
+                    match = re.search(r'\((\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\)', text)
+                    if match:
+                        start_str, end_str = match.groups()
+                        # Chuyển chữ thành dạng thời gian để so sánh
+                        start_date = datetime.strptime(start_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
+                        end_date = datetime.strptime(end_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
+                        end_date = end_date.replace(hour=23, minute=59, second=59) # Căn đến cuối ngày của tuần đó
+                        
+                        # Nếu hôm nay nằm trong tuần này -> Bấm chọn luôn!
+                        if start_date <= today <= end_date:
+                            print(f"✅ Đã tìm thấy tuần hiện tại: {text.replace(chr(10), ' ')}")
+                            row.click()
+                            found_week = True
+                            page.wait_for_timeout(3000) # Đợi web load lịch mới
+                            break
+                
+                if not found_week:
+                    print("⚠️ Không tìm thấy ngày hôm nay trong danh sách. Có thể đang nghỉ hè/lễ. Chụp tuần mặc định.")
+                    page.keyboard.press('Escape') # Ấn Esc để đóng menu thả xuống
             
-            # Khóa mục tiêu vào cái bảng lịch học đang hiển thị
+            except Exception as e:
+                print(f"⚠️ Lỗi lúc chọn tuần (nhưng vẫn sẽ chụp): {e}")
+            # ---------------------------------
+            
+            print("📸 BƯỚC 6: Đang chụp ảnh lịch học...")
             table_locator = page.locator('.table-bordered:visible').first
             page.wait_for_selector('.table-bordered:visible', timeout=15000)
             
-            print("📸 BƯỚC 6: Đang chụp ảnh lịch học...")
-            # Chụp riêng cái bảng đó và lưu thành file anh_lich_hoc.png
             image_path = "anh_lich_hoc.png"
             table_locator.screenshot(path=image_path)
             
@@ -68,7 +91,7 @@ def scrape_lich_hoc_to_image():
             return image_path
 
         except Exception as e:
-            print(f"❌ LỖI: {e}")
+            print(f"❌ LỖI TRONG QUÁ TRÌNH CÀO WEB: {e}")
             browser.close()
             return None
 
@@ -81,15 +104,13 @@ def send_telegram_photo(photo_path):
         print("❌ Lỗi thiếu Token hoặc Chat ID.")
         return
 
-    # Dùng API sendPhoto thay vì sendMessage
     url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
     
     try:
-        # Mở file ảnh vừa chụp để gửi
         with open(photo_path, 'rb') as photo:
             payload = {
                 "chat_id": chat_id,
-                "caption": "📌 Lịch học chuẩn tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
+                "caption": "📌 Lịch học chuẩn đét tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
             }
             files = {
                 "photo": photo
@@ -104,10 +125,7 @@ def send_telegram_photo(photo_path):
         print(f"❌ Lỗi gửi ảnh: {e}")
 
 if __name__ == "__main__":
-    # Lấy đường dẫn file ảnh vừa chụp
     saved_image_path = scrape_lich_hoc_to_image()
-    
-    # Nếu chụp thành công thì gửi qua Tele
     if saved_image_path:
         send_telegram_photo(saved_image_path)
     else:
