@@ -3,8 +3,8 @@ import requests
 from playwright.sync_api import sync_playwright
 
 def scrape_lich_hoc():
-    msv = os.environ.get('MSV')
-    password = os.environ.get('PASS_TRUONG')
+    msv = os.environ.get('2451271131')
+    password = os.environ.get('038206016725')
 
     with sync_playwright() as p:
         # Mở trình duyệt ẩn (headless=True)
@@ -20,8 +20,8 @@ def scrape_lich_hoc():
             # Đăng nhập (Thủy Lợi dùng login ẩn hoặc popup, điền mã theo id nếu có)
             # Tạm thời điền theo selector phổ biến của hệ thống này
             print("🔑 Đang đăng nhập...")
-            page.fill('input[name="2451271131"]', msv)
-            page.fill('input[name="038206016725"]', password)
+            page.fill('input[name="username"]', msv)
+            page.fill('input[name="password"]', password)
             page.click('button[type="submit"]') # Hoặc id nút đăng nhập của trường
             
             # Đợi đăng nhập thành công và chuyển hướng
