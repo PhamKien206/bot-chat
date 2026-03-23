@@ -17,11 +17,24 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install requests
+      # --- ĐOẠN NÀY ĐÃ ĐƯỢC BỔ SUNG PLAYWRIGHT ---
+      - name: Cài đặt thư viện
+        run: |
+          pip install requests playwright
+          python -m playwright install chromium
 
       - name: Run Bot
         env:
           TELE_BOT_TOKEN: ${{ secrets.TELE_BOT_TOKEN }}
           TELE_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
+          MSV: ${{ secrets.MSV }}
+          PASS_TRUONG: ${{ secrets.PASS_TRUONG }}
         run: python bot_telegram.py
+
+      # Tải ảnh về nếu web trường cản đường
+      - name: Lưu ảnh lỗi (Nếu có)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loi-cao-web-truong
+          path: debug_web.png
