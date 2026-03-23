@@ -62,19 +62,23 @@ def send_zalo_msg(message):
         page.goto('https://chat.zalo.me/')
 
         # Đổi lại tên người nhận thành Cloud của tôi (hoặc đổi thành tên nhóm của bạn)
-        nguoi_nhan = 'cc' 
+        nguoi_nhan = 'Cloud của tôi' 
         
         try:
             print(f"Đang chờ Zalo Web load để tìm: {nguoi_nhan}...")
             page.wait_for_selector('#contact-search-input', timeout=60000) 
             page.fill('#contact-search-input', nguoi_nhan)
-            time.sleep(2)
+            
+            # Tăng lên 5 giây để Zalo load xong kết quả tìm kiếm
+            time.sleep(5) 
             page.keyboard.press('Enter')
             
             print(f"Đang gõ tin nhắn...")
             page.wait_for_selector('#richInput', timeout=15000)
             page.fill('#richInput', message)
-            time.sleep(2)
+            
+            # Tăng lên 3 giây để khung chat nhận diện đủ chữ
+            time.sleep(3) 
             page.keyboard.press('Enter')
             
             print("🎉 Bắn tin nhắn thành công!")
