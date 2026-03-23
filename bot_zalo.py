@@ -2,20 +2,16 @@ import json
 import os
 import zipfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 def get_smart_schedule():
-    # 1. Đọc file dữ liệu lịch học
     with open('lich_hoc.json', 'r', encoding='utf-8') as f:
         all_periods = json.load(f)
     
-    # 2. Thiết lập múi giờ Việt Nam (UTC+7) để chạy đúng trên server Quốc tế
-    vn_tz = timezone(timedelta(hours=7))
-    now = datetime.now(vn_tz)
-    
+    now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
-    weekday = str(now.weekday() + 2) # Chuyển đổi: Thứ 2 là 2, Chủ nhật là 8
+    weekday = str(now.weekday() + 2) 
     
     current_schedule = None
     for p in all_periods:
@@ -24,12 +20,12 @@ def get_smart_schedule():
             break
             
     if not current_schedule:
-        return "Hiện tại không nằm trong giai đoạn học tập. Nghỉ ngơi thôi! 🎉"
+        return "Nghỉ hè rồi hoặc đang trong kỳ nghỉ lễ, không có lịch đâu! 🎉"
 
     day_data = current_schedule.get(weekday, [])
     
     if not day_data:
-        return f"📅 Hôm nay (Thứ {weekday}, {now.strftime('%d/%m')}): Không có lịch học. Thoải mái nhé!"
+        return f"📅 Hôm nay (Thứ {weekday}): Không có lịch học. Thoải mái code nhé!"
 
     msg = f"📌 Lịch học Thứ {weekday} ({now.strftime('%d/%m')}):\n\n"
     for item in day_data:
@@ -38,66 +34,58 @@ def get_smart_schedule():
     return msg
 
 def send_zalo_msg(message):
-    print("🚀 Bắt đầu quy trình gửi Zalo...")
+    print("Bắt đầu quy trình gửi Zalo...")
     
-    # Giải nén dữ liệu phiên đăng nhập
+    # --- ĐOẠN CODE GIẢI NÉN BẮT BUỘC PHẢI CÓ ---
     zip_name = 'zalo_user_data.zip'
     extract_dir = './zalo_user_data'
     
     if os.path.exists(zip_name):
-        print(f"📦 Đang giải nén {zip_name}...")
+        print(f"Đang giải nén file {zip_name}...")
         with zipfile.ZipFile(zip_name, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
-        print("✅ Giải nén xong!")
+        print("Đã giải nén xong!")
     else:
-        print(f"⚠️ Cảnh báo: Không tìm thấy {zip_name}!")
+        print(f"Cảnh báo: Không tìm thấy file {zip_name}! Quá trình đăng nhập có thể thất bại.")
+    # ------------------------------------------
 
     with sync_playwright() as p:
-        # Khởi động trình duyệt với bộ nhớ cũ
+        # Sử dụng thư mục vừa giải nén
         browser = p.chromium.launch_persistent_context(
             extract_dir, 
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            headless=True, # Bắt buộc True khi chạy trên GitHub
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] # Lệnh chống sập trên Linux
         )
         page = browser.new_page()
-        
-        # Tên người nhận (Phải khớp chính xác tên trên Zalo của bạn)
+        page.goto('https://chat.zalo.me/')
+
+        # Đổi lại tên người nhận thành Cloud của tôi (hoặc đổi thành tên nhóm của bạn)
         nguoi_nhan = 'Cloud của tôi' 
         
         try:
-            print("🌐 Đang truy cập Zalo Web...")
-            page.goto('https://chat.zalo.me/', timeout=60000)
-
-            # Chờ ô tìm kiếm xuất hiện
-            print(f"🔍 Đang tìm kiếm: {nguoi_nhan}...")
+            print(f"Đang chờ Zalo Web load để tìm: {nguoi_nhan}...")
             page.wait_for_selector('#contact-search-input', timeout=60000) 
             page.fill('#contact-search-input', nguoi_nhan)
-            
-            # Đợi kết quả tìm kiếm hiện ra (quan trọng)
-            time.sleep(5) 
+            time.sleep(2)
             page.keyboard.press('Enter')
             
-            # Đợi khung soạn thảo hiện ra
-            print("✍️ Đang soạn tin nhắn...")
-            page.wait_for_selector('#richInput', timeout=20000)
+            print(f"Đang gõ tin nhắn...")
+            page.wait_for_selector('#richInput', timeout=15000)
             page.fill('#richInput', message)
-            
-            # Đợi tin nhắn được điền đầy đủ
-            time.sleep(3) 
+            time.sleep(2)
             page.keyboard.press('Enter')
             
-            print("✅ Đã chốt đơn! Gửi thành công.")
+            print("🎉 Bắn tin nhắn thành công!")
             time.sleep(5) 
             
         except Exception as e:
-            print(f"❌ Thất bại: {e}")
-            # Chụp ảnh màn hình để debug
-            page.screenshot(path="debug_zalo.png")
-            print("📸 Đã chụp ảnh màn hình lỗi (debug_zalo.png)")
+            print("❌ Lỗi rồi, Zalo Web không phản hồi. Chi tiết:")
+            print(e)
 
         browser.close()
 
+# Bắt đầu chạy
 if __name__ == "__main__":
     noidung = get_smart_schedule()
-    print("--- Nội dung dự kiến ---\n", noidung)
+    print("Nội dung sẽ gửi:\n", noidung)
     send_zalo_msg(noidung)
