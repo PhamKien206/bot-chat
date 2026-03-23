@@ -39,13 +39,20 @@ def scrape_lich_hoc():
             # Web trường dùng Angular tải dữ liệu hơi chậm, cho bot nghỉ 5 giây để đợi
             page.wait_for_timeout(5000)
 
-            print("🔍 BƯỚC 5: Đang tìm vùng chứa lịch học...")
-            # Dùng :visible để báo bot chỉ lấy khung nào đang ĐƯỢC HIỂN THỊ trên màn hình
-            page.wait_for_selector('.portlet-body:visible', timeout=30000)
+            print("🔍 BƯỚC 5: Chuyển sang tab Bảng để xem lịch theo tuần...")
+            # Bảo bot bấm vào cái nút có chữ "Bảng"
+            page.click('a:has-text("Bảng")')
             
-            print("✂️ BƯỚC 6: Đang cào dữ liệu text...")
-            # Cào toàn bộ chữ trong khung đó
-            lich_raw = page.locator('.portlet-body:visible').first.inner_text()
+            print("⏳ Đang đợi bảng lịch tuần tải dữ liệu...")
+            # Đợi 3 giây cho web chuyển tab và vẽ xong cái bảng
+            page.wait_for_timeout(3000)
+            
+            # Lúc này cái thẻ table bị ẩn lúc nãy đã hiện lên rồi, ta tóm nó luôn
+            page.wait_for_selector('.table-bordered:visible', timeout=15000)
+            
+            print("✂️ BƯỚC 6: Đang cào dữ liệu lịch tuần...")
+            # Lấy toàn bộ chữ nằm trong cái bảng lịch tuần đó
+            lich_raw = page.locator('.table-bordered:visible').first.inner_text()
             
             print("✅ Xong! Đã cào được dữ liệu thành công, chuẩn bị đóng trình duyệt.")
             browser.close()
