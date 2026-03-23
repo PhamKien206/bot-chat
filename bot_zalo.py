@@ -9,7 +9,9 @@ def get_smart_schedule():
     with open('lich_hoc.json', 'r', encoding='utf-8') as f:
         all_periods = json.load(f)
     
-    now = datetime.now()
+    vn_tz = timezone(timedelta(hours=7))
+    now = datetime.now(vn_tz)
+    
     today_str = now.strftime("%Y-%m-%d")
     weekday = str(now.weekday() + 2) 
     
