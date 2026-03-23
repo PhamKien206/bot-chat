@@ -20,7 +20,7 @@ def scrape_lich_hoc():
             print("🚀 BƯỚC 1: Truy cập trang đăng nhập sinh viên...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/login', timeout=60000)
 
-           print("🔑 BƯỚC 2: Điền tài khoản và mật khẩu...")
+            print("🔑 BƯỚC 2: Điền tài khoản và mật khẩu...")
             # Dùng dấu # để gọi chính xác ID của ô nhập
             page.fill('#username', msv)
             page.fill('#password', password)
