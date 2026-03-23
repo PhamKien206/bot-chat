@@ -25,7 +25,7 @@ def get_smart_schedule():
     day_data = current_schedule.get(weekday, [])
     
     if not day_data:
-        return f"📅 Hôm nay (Thứ {weekday}): Không có lịch học. Thoải mái code nhé!"
+        return f"📅 Hôm nay (Thứ {weekday}): Không có lịch học"
 
     msg = f"📌 Lịch học Thứ {weekday} ({now.strftime('%d/%m')}):\n\n"
     for item in day_data:
