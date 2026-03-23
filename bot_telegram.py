@@ -35,19 +35,24 @@ def scrape_lich_hoc():
             print("📅 BƯỚC 4: Chuyển hướng vào trang Lịch học (Profile)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
-            print("🔍 BƯỚC 5: Đang tìm bảng dữ liệu lịch học...")
-            # Chờ bảng lịch học xuất hiện tối đa 30 giây
-            page.wait_for_selector('.table-bordered', timeout=30000)
+            print("⏳ Đang chờ web tải dữ liệu...")
+            # Web trường dùng Angular tải dữ liệu hơi chậm, cho bot nghỉ 5 giây để đợi
+            page.wait_for_timeout(5000)
+
+            print("🔍 BƯỚC 5: Đang tìm vùng chứa lịch học...")
+            # Dùng :visible để báo bot chỉ lấy khung nào đang ĐƯỢC HIỂN THỊ trên màn hình
+            page.wait_for_selector('.portlet-body:visible', timeout=30000)
             
             print("✂️ BƯỚC 6: Đang cào dữ liệu text...")
-            lich_raw = page.locator('.portlet-body').inner_text()
+            # Cào toàn bộ chữ trong khung đó
+            lich_raw = page.locator('.portlet-body:visible').first.inner_text()
             
             print("✅ Xong! Đã cào được dữ liệu thành công, chuẩn bị đóng trình duyệt.")
             browser.close()
             
             # Cắt bớt nếu text quá dài (Telegram giới hạn 4096 ký tự/tin nhắn)
             if len(lich_raw) > 3500:
-                lich_raw = lich_raw[:3500] + "\n\n...(Dữ liệu quá dài, đã cắt bớt)..."
+            lich_raw = lich_raw[:3500] + "\n\n...(Dữ liệu quá dài, đã cắt bớt)..."
 
             return f"📌 LỊCH HỌC MỚI NHẤT TỪ WEB TRƯỜNG:\n\n{lich_raw}"
 
