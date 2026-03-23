@@ -1,50 +1,63 @@
-import json
 import os
 import requests
-from datetime import datetime, timedelta, timezone
+from playwright.sync_api import sync_playwright
 
-def get_smart_schedule():
-    # Đọc dữ liệu lịch học
-    with open('lich_hoc.json', 'r', encoding='utf-8') as f:
-        all_periods = json.load(f)
-    
-    # Cài múi giờ VN (UTC+7)
-    vn_tz = timezone(timedelta(hours=7))
-    now = datetime.now(vn_tz)
-    
-    today_str = now.strftime("%Y-%m-%d")
-    weekday = str(now.weekday() + 2) 
-    
-    current_schedule = None
-    for p in all_periods:
-        if p['start'] <= today_str <= p['end']:
-            current_schedule = p['schedule']
-            break
+def scrape_lich_hoc():
+    msv = os.environ.get('MSV')
+    password = os.environ.get('PASS_TRUONG')
+
+    with sync_playwright() as p:
+        # Mở trình duyệt ẩn (headless=True)
+        browser = p.chromium.launch(headless=True)
+        # Thiết lập kích thước màn hình lớn để bảng hiện đầy đủ
+        context = browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = context.new_page()
+
+        try:
+            print("🚀 Truy cập trang chủ sinh viên...")
+            page.goto('https://sinhvien1.tlu.edu.vn/#/login', timeout=60000)
+
+            # Đăng nhập (Thủy Lợi dùng login ẩn hoặc popup, điền mã theo id nếu có)
+            # Tạm thời điền theo selector phổ biến của hệ thống này
+            print("🔑 Đang đăng nhập...")
+            page.fill('input[name="2451271131"]', msv)
+            page.fill('input[name="038206016725"]', password)
+            page.click('button[type="submit"]') # Hoặc id nút đăng nhập của trường
             
-    if not current_schedule:
-        return "Nghỉ hè rồi hoặc đang trong kỳ nghỉ lễ, không có lịch đâu! 🎉"
+            # Đợi đăng nhập thành công và chuyển hướng
+            page.wait_for_load_state('networkidle')
 
-    day_data = current_schedule.get(weekday, [])
-    
-    if not day_data:
-        return f"📅 Hôm nay (Thứ {weekday}, {now.strftime('%d/%m')}): Không có lịch học. Thoải mái code nhé!"
+            # Truy cập trực tiếp trang Profile nơi có lịch học (như trong ảnh bạn chụp)
+            print("📅 Đang lấy lịch học từ Profile...")
+            page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
-    msg = f"📌 Lịch học Thứ {weekday} ({now.strftime('%d/%m')}):\n\n"
-    for item in day_data:
-        msg += f"⏰ {item['gio']}: {item['mon']}\n📍 {item['phong']}\n"
-        msg += "------------------\n"
-    return msg
+            # Chờ cái bảng xuất hiện (Dựa trên ảnh: class .table-bordered)
+            # Chúng ta sẽ chờ thẻ chứa "Thông tin chi tiết" load xong
+            page.wait_for_selector('.table-bordered', timeout=30000)
+            
+            # Lấy toàn bộ nội dung text của bảng lịch học
+            # Bạn nên chọn tab "Bảng" để lấy text sạch hơn, hoặc cào trực tiếp ở đây
+            lich_raw = page.locator('.portlet-body').inner_text()
+            
+            print("✅ Đã cào được dữ liệu!")
+            browser.close()
+            
+            return f"📌 LỊCH HỌC MỚI NHẤT:\n\n{lich_raw[:1000]}..." # Cắt bớt nếu quá dài
+
+        except Exception as e:
+            print(f"❌ Lỗi: {e}")
+            page.screenshot(path="debug_web.png")
+            browser.close()
+            return f"❌ Lỗi lấy lịch: {e}"
 
 def send_telegram_msg(message):
-    # Lấy Token và ID từ GitHub Secrets bảo mật
     bot_token = os.environ.get('TELE_BOT_TOKEN')
     chat_id = os.environ.get('TELE_CHAT_ID')
 
     if not bot_token or not chat_id:
-        print("❌ Lỗi: Chưa cài đặt TELE_BOT_TOKEN hoặc TELE_CHAT_ID trong GitHub Secrets!")
+        print("❌ Lỗi: Chưa cài TELE_BOT_TOKEN hoặc TELE_CHAT_ID!")
         return
 
-    # API chính thức của Telegram, gọi cái là tin nhắn bay đến ngay
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -54,13 +67,12 @@ def send_telegram_msg(message):
     try:
         response = requests.post(url, json=payload)
         if response.status_code == 200:
-            print("🎉 Ting Ting! Đã gửi tin nhắn Telegram thành công!")
+            print("🎉 Ting Ting! Đã gửi lịch học qua Telegram thành công!")
         else:
-            print(f"❌ Lỗi gửi tin: {response.text}")
+            print(f"❌ Lỗi gửi Telegram: {response.text}")
     except Exception as e:
-        print(f"❌ Lỗi kết nối: {e}")
+        print(f"❌ Lỗi kết nối Telegram: {e}")
 
 if __name__ == "__main__":
-    noidung = get_smart_schedule()
-    print("Nội dung sẽ gửi:\n", noidung)
-    send_telegram_msg(noidung)
+    noidung_lich = scrape_lich_hoc()
+    send_telegram_msg(noidung_lich)
