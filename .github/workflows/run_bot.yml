@@ -23,4 +23,4 @@ jobs:
           python -m playwright install chromium
 
       - name: Run Bot
-        run: python zalo_user_data.py
+        run: python bot_zalo.py
