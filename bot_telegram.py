@@ -20,13 +20,14 @@ def scrape_lich_hoc():
             print("🚀 BƯỚC 1: Truy cập trang đăng nhập sinh viên...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/login', timeout=60000)
 
-            print("🔑 BƯỚC 2: Điền tài khoản và mật khẩu...")
-            # Điền MSV và Password vào đúng ô
-            page.fill('input[name="username"]', msv)
-            page.fill('input[name="password"]', password)
+           print("🔑 BƯỚC 2: Điền tài khoản và mật khẩu...")
+            # Dùng dấu # để gọi chính xác ID của ô nhập
+            page.fill('#username', msv)
+            page.fill('#password', password)
             
             print("🖱️ BƯỚC 3: Bấm nút Đăng nhập...")
-            page.click('button[type="submit"]') 
+            # Bảo Playwright tìm đúng cái nút có chứa chữ "Đăng nhập" rồi bấm vào
+            page.click('button:has-text("Đăng nhập")') 
             
             # Đợi web xử lý đăng nhập xong
             page.wait_for_load_state('networkidle')
