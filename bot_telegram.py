@@ -111,7 +111,7 @@ def send_telegram_photo(photo_path):
         with open(photo_path, 'rb') as photo:
             payload = {
                 "chat_id": chat_id,
-                "caption": "📌 Lịch học của sếp đây! (Nếu sai tuần là do web trường chưa cập nhật học kỳ nhé) 💻"
+                "caption": "Lịch Học Tuần Này "
             }
             files = {
                 "photo": photo
