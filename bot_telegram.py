@@ -52,7 +52,7 @@ def scrape_lich_hoc():
             
             # Cắt bớt nếu text quá dài (Telegram giới hạn 4096 ký tự/tin nhắn)
             if len(lich_raw) > 3500:
-            lich_raw = lich_raw[:3500] + "\n\n...(Dữ liệu quá dài, đã cắt bớt)..."
+                lich_raw = lich_raw[:3500] + "\n\n...(Dữ liệu quá dài, đã cắt bớt)..."
 
             return f"📌 LỊCH HỌC MỚI NHẤT TỪ WEB TRƯỜNG:\n\n{lich_raw}"
 
