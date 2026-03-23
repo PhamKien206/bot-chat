@@ -2,98 +2,95 @@ import os
 import requests
 from playwright.sync_api import sync_playwright
 
-def scrape_lich_hoc():
-    # 1. LẤY CHÌA KHÓA TỪ GITHUB SECRETS (Tuyệt đối không điền số thật vào đây)
+def scrape_lich_hoc_to_image():
     msv = os.environ.get('MSV')
     password = os.environ.get('PASS_TRUONG')
 
     if not msv or not password:
-        return "❌ Lỗi: Không tìm thấy MSV hoặc PASS_TRUONG trong GitHub Secrets!"
+        print("❌ Lỗi: Không tìm thấy MSV hoặc PASS_TRUONG!")
+        return None
 
     with sync_playwright() as p:
-        # Mở trình duyệt ẩn
         browser = p.chromium.launch(headless=True)
+        # Để màn hình siêu rộng để bảng lịch học không bị co dúm
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
 
         try:
-            print("🚀 BƯỚC 1: Truy cập trang đăng nhập sinh viên...")
+            print("🚀 BƯỚC 1: Truy cập trang đăng nhập...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/login', timeout=60000)
 
             print("🔑 BƯỚC 2: Điền tài khoản và mật khẩu...")
-            # Dùng dấu # để gọi chính xác ID của ô nhập
             page.fill('#username', msv)
             page.fill('#password', password)
             
             print("🖱️ BƯỚC 3: Bấm nút Đăng nhập...")
-            # Bảo Playwright tìm đúng cái nút có chứa chữ "Đăng nhập" rồi bấm vào
             page.click('button:has-text("Đăng nhập")') 
-            
-            # Đợi web xử lý đăng nhập xong
             page.wait_for_load_state('networkidle')
 
-            print("📅 BƯỚC 4: Chuyển hướng vào trang Lịch học (Profile)...")
+            print("📅 BƯỚC 4: Vào trang Profile...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
-            print("⏳ Đang chờ web tải dữ liệu...")
-            # Web trường dùng Angular tải dữ liệu hơi chậm, cho bot nghỉ 5 giây để đợi
-            page.wait_for_timeout(5000)
-
-            print("🔍 BƯỚC 5: Chuyển sang tab Bảng để xem lịch theo tuần...")
-            # Bảo bot bấm vào cái nút có chữ "Bảng"
+            print("🔍 BƯỚC 5: Chuyển sang tab Bảng...")
+            page.wait_for_timeout(5000) # Đợi web load khung ngoài
             page.click('a:has-text("Bảng")')
+            page.wait_for_timeout(3000) # Đợi web vẽ cái bảng
             
-            print("⏳ Đang đợi bảng lịch tuần tải dữ liệu...")
-            # Đợi 3 giây cho web chuyển tab và vẽ xong cái bảng
-            page.wait_for_timeout(3000)
-            
-            # Lúc này cái thẻ table bị ẩn lúc nãy đã hiện lên rồi, ta tóm nó luôn
+            # Khóa mục tiêu vào cái bảng lịch học đang hiển thị
+            table_locator = page.locator('.table-bordered:visible').first
             page.wait_for_selector('.table-bordered:visible', timeout=15000)
             
-            print("✂️ BƯỚC 6: Đang cào dữ liệu lịch tuần...")
-            # Lấy toàn bộ chữ nằm trong cái bảng lịch tuần đó
-            lich_raw = page.locator('.table-bordered:visible').first.inner_text()
+            print("📸 BƯỚC 6: Đang chụp ảnh lịch học...")
+            # Chụp riêng cái bảng đó và lưu thành file anh_lich_hoc.png
+            image_path = "anh_lich_hoc.png"
+            table_locator.screenshot(path=image_path)
             
-            print("✅ Xong! Đã cào được dữ liệu thành công, chuẩn bị đóng trình duyệt.")
+            print("✅ Xong! Đã chụp ảnh thành công.")
             browser.close()
-            
-            # Cắt bớt nếu text quá dài (Telegram giới hạn 4096 ký tự/tin nhắn)
-            if len(lich_raw) > 3500:
-                lich_raw = lich_raw[:3500] + "\n\n...(Dữ liệu quá dài, đã cắt bớt)..."
-
-            return f"📌 LỊCH HỌC MỚI NHẤT TỪ WEB TRƯỜNG:\n\n{lich_raw}"
+            return image_path
 
         except Exception as e:
-            print(f"❌ CÓ LỖI XẢY RA: {e}")
-            page.screenshot(path="debug_web.png")
-            print("📸 Đã chụp ảnh màn hình lỗi lưu vào file debug_web.png")
+            print(f"❌ LỖI: {e}")
             browser.close()
-            return f"❌ Lỗi lấy lịch từ web trường. Chi tiết lỗi:\n{e}"
+            return None
 
-def send_telegram_msg(message):
-    print("🚀 BẮT ĐẦU GỬI TELEGRAM...")
+def send_telegram_photo(photo_path):
+    print("🚀 BẮT ĐẦU GỬI ẢNH QUA TELEGRAM...")
     bot_token = os.environ.get('TELE_BOT_TOKEN')
     chat_id = os.environ.get('TELE_CHAT_ID')
 
     if not bot_token or not chat_id:
-        print("❌ Lỗi: Chưa cài TELE_BOT_TOKEN hoặc TELE_CHAT_ID trong Secrets!")
+        print("❌ Lỗi thiếu Token hoặc Chat ID.")
         return
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message
-    }
-
+    # Dùng API sendPhoto thay vì sendMessage
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    
     try:
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            print("🎉 TING TING! Đã gửi tin nhắn qua Telegram thành công!")
-        else:
-            print(f"❌ Lỗi từ Telegram: {response.text}")
+        # Mở file ảnh vừa chụp để gửi
+        with open(photo_path, 'rb') as photo:
+            payload = {
+                "chat_id": chat_id,
+                "caption": "📌 Lịch học tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
+            }
+            files = {
+                "photo": photo
+            }
+            response = requests.post(url, data=payload, files=files)
+            
+            if response.status_code == 200:
+                print("🎉 TING TING! Đã gửi ẢNH lịch học qua Telegram thành công!")
+            else:
+                print(f"❌ Lỗi từ Telegram: {response.text}")
     except Exception as e:
-        print(f"❌ Lỗi mạng khi kết nối tới Telegram: {e}")
+        print(f"❌ Lỗi gửi ảnh: {e}")
 
 if __name__ == "__main__":
-    noidung_lich = scrape_lich_hoc()
-    send_telegram_msg(noidung_lich)
+    # Lấy đường dẫn file ảnh vừa chụp
+    saved_image_path = scrape_lich_hoc_to_image()
+    
+    # Nếu chụp thành công thì gửi qua Tele
+    if saved_image_path:
+        send_telegram_photo(saved_image_path)
+    else:
+        print("❌ Không có ảnh để gửi do quá trình cào web bị lỗi.")
