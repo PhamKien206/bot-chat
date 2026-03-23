@@ -60,7 +60,7 @@ def send_zalo_msg(message):
         page.goto('https://chat.zalo.me/')
 
         # Đổi lại tên người nhận thành Cloud của tôi (hoặc đổi thành tên nhóm của bạn)
-        nguoi_nhan = 'Cloud của tôi' 
+        nguoi_nhan = 'cc' 
         
         try:
             print(f"Đang chờ Zalo Web load để tìm: {nguoi_nhan}...")
