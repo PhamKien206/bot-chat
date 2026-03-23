@@ -12,7 +12,7 @@ def scrape_lich_hoc_to_image():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Để màn hình siêu rộng để bảng lịch học không bị co dúm
+        # Thiết lập kích thước màn hình siêu rộng để bảng lịch học không bị co dúm
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
 
@@ -31,10 +31,28 @@ def scrape_lich_hoc_to_image():
             print("📅 BƯỚC 4: Vào trang Profile...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
-            print("🔍 BƯỚC 5: Chuyển sang tab Bảng...")
+            print("🔍 BƯỚC 5: Chuyển sang tab Bảng và chọn tuần hiện tại...")
             page.wait_for_timeout(5000) # Đợi web load khung ngoài
             page.click('a:has-text("Bảng")')
-            page.wait_for_timeout(3000) # Đợi web vẽ cái bảng
+            
+            # --- ĐOẠN CODE MỚI: CHỌN TUẦN HIỆN TẠI ---
+            # Web trường thường có nút "Tuần này" hoặc một dropdown menu để chọn tuần.
+            # Bạn hãy kiểm tra trên web trường xem có nút nào tên là "Tuần này" không nhé.
+            
+            # GIẢ SỬ WEB CÓ NÚT "TUẦN NÀY":
+            try:
+                # Tìm và click vào nút có chữ "Tuần này". 
+                # Nếu web trường không có nút này, bạn hãy thay bằng ID hoặc Selector của ô chọn tuần.
+                print("⏳ Đang tìm và bấm nút 'Tuần này'...")
+                # selector phổ biến: text="Tuần này" hoặc .btn-current-week
+                page.click('button:has-text("Tuần này")')
+                # Sau khi click, cho web nghỉ 3 giây để vẽ lại bảng mới
+                page.wait_for_timeout(3000)
+                print("✅ Đã chọn xong tuần hiện tại.")
+            except Exception:
+                # Nếu không tìm thấy nút, in ra cảnh báo nhưng vẫn tiếp tục để chụp ảnh (có thể bị sai tuần)
+                print("⚠️ Cảnh báo: Không tìm thấy nút 'Tuần này'. Bot sẽ chụp tuần mặc định.")
+            # ----------------------------------------
             
             # Khóa mục tiêu vào cái bảng lịch học đang hiển thị
             table_locator = page.locator('.table-bordered:visible').first
@@ -71,7 +89,7 @@ def send_telegram_photo(photo_path):
         with open(photo_path, 'rb') as photo:
             payload = {
                 "chat_id": chat_id,
-                "caption": "📌 Lịch học tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
+                "caption": "📌 Lịch học chuẩn tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
             }
             files = {
                 "photo": photo
