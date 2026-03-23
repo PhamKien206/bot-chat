@@ -1,0 +1,41 @@
+[
+  {
+    "period": "Giai đoạn 1 (Tuần 21-23)",
+    "start": "2026-01-19",
+    "end": "2026-02-08",
+    "schedule": {
+      "2": [],
+      "3": [{"gio": "12:55-14:40", "mon": "Nền tảng phát triển Web", "phong": "302-B5"}, {"gio": "14:45-16:30", "mon": "Kinh tế chính trị Mác - Lênin", "phong": "302-B5"}],
+      "4": [{"gio": "12:55-15:35", "mon": "Xác suất thống kê", "phong": "302-B5"}, {"gio": "15:40-18:20", "mon": "Mạng máy tính", "phong": "302-B5"}],
+      "5": [{"gio": "09:50-12:25", "mon": "Quần vợt", "phong": "Sân tennis"}, {"gio": "12:55-15:35", "mon": "Nền tảng phát triển Web (TH)", "phong": "402-C5"}],
+      "6": [{"gio": "12:55-14:40", "mon": "Nền tảng phát triển Web", "phong": "302-B5"}, {"gio": "14:45-16:30", "mon": "Kinh tế chính trị Mác - Lênin", "phong": "302-B5"}],
+      "7": [{"gio": "07:00-09:40", "mon": "Tiếng Anh chuyên ngành CNTT", "phong": "229-A2"}, {"gio": "12:55-15:35", "mon": "Xác suất thống kê", "phong": "301-B5"}]
+    }
+  },
+  {
+    "period": "Giai đoạn 2 (Tuần 26-30)",
+    "start": "2026-02-23",
+    "end": "2026-03-29",
+    "schedule": {
+      "2": [],
+      "3": [{"gio": "12:55-14:40", "mon": "Nền tảng phát triển Web", "phong": "302-B5"}, {"gio": "14:45-16:30", "mon": "Kinh tế chính trị Mác - Lênin", "phong": "302-B5"}],
+      "4": [{"gio": "12:55-15:35", "mon": "Xác suất thống kê", "phong": "302-B5"}, {"gio": "15:40-18:20", "mon": "Mạng máy tính", "phong": "302-B5"}],
+      "5": [{"gio": "09:50-12:25", "mon": "Quần vợt", "phong": "Sân tennis"}, {"gio": "12:55-15:35", "mon": "Nền tảng phát triển Web (TH)", "phong": "402-C5"}],
+      "6": [{"gio": "12:55-14:40", "mon": "Nền tảng phát triển Web", "phong": "302-B5"}, {"gio": "14:45-16:30", "mon": "Kinh tế chính trị Mác - Lênin", "phong": "302-B5"}],
+      "7": [{"gio": "07:00-09:40", "mon": "Tiếng Anh chuyên ngành CNTT", "phong": "229-A2"}, {"gio": "12:55-15:35", "mon": "Xác suất thống kê", "phong": "301-B5"}]
+    }
+  },
+  {
+    "period": "Giai đoạn 3 (Tuần 33-41)",
+    "start": "2026-04-13",
+    "end": "2026-06-14",
+    "schedule": {
+      "2": [],
+      "3": [{"gio": "14:45-16:30", "mon": "Phân tích & TK hệ thống", "phong": "302-B5"}, {"gio": "16:35-18:20", "mon": "Lập trình Windows", "phong": "302-B5"}],
+      "4": [{"gio": "15:40-18:20", "mon": "Mạng máy tính", "phong": "301-B5"}],
+      "5": [{"gio": "12:55-15:35", "mon": "Phân tích & TK hệ thống (TH)", "phong": "205-B5"}, {"gio": "15:40-18:20", "mon": "Lập trình Windows (TH)", "phong": "205-B5"}],
+      "6": [{"gio": "14:45-16:30", "mon": "Phân tích & TK hệ thống", "phong": "302-B5"}, {"gio": "16:35-18:20", "mon": "Lập trình Windows", "phong": "302-B5"}],
+      "7": [{"gio": "07:00-09:40", "mon": "Tiếng Anh chuyên ngành CNTT", "phong": "229-A2"}]
+    }
+  }
+]
