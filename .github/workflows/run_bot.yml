@@ -2,7 +2,7 @@ name: Telegram Schedule Bot
 
 on:
   schedule:
-    - cron: '0 23 * * *' # Chạy 6h sáng VN
+   - cron: '0 22 * * 0' # Chạy 6h sáng VN
   workflow_dispatch:
 
 jobs:
