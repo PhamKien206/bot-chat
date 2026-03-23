@@ -37,46 +37,47 @@ def scrape_lich_hoc_to_image():
             page.click('a:has-text("Bảng")')
             page.wait_for_timeout(2000)
             
-            # --- BỘ NÃO TÌM TUẦN HIỆN TẠI ---
-            print("🧠 Bot đang tính toán ngày tháng để chọn đúng tuần...")
+            # --- BỘ NÃO TÌM TUẦN HIỆN TẠI V2 ---
+            print("🧠 Đang tìm và mở ô chọn Tuần...")
             try:
-                # 1. Bấm vào cái ô chọn tuần để nó sổ danh sách ra
-                page.click('.ui-select-match')
+                # Tuyệt chiêu: Tìm chữ "Tuần", sau đó lấy cái ô bấm ngay dưới nó
+                dropdown_tuan = page.locator('label').filter(has_text="Tuần").locator('..').locator('.ui-select-match')
+                dropdown_tuan.click(timeout=5000)
+                
+                # Đợi danh sách thả xuống hiện ra
                 page.wait_for_selector('.ui-select-choices-row', timeout=5000)
                 
-                # 2. Lấy thời gian hiện tại ở Việt Nam
                 vn_tz = timezone(timedelta(hours=7))
                 today = datetime.now(vn_tz)
                 
-                # 3. Đọc từng tuần và tìm xem hôm nay nằm ở tuần nào
                 rows = page.locator('.ui-select-choices-row').all()
                 found_week = False
                 
                 for row in rows:
                     text = row.inner_text()
-                    # Tìm cái đoạn ngày tháng kiểu (1/9/2025 - 7/9/2025)
                     match = re.search(r'\((\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\)', text)
                     if match:
                         start_str, end_str = match.groups()
-                        # Chuyển chữ thành dạng thời gian để so sánh
                         start_date = datetime.strptime(start_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
                         end_date = datetime.strptime(end_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
-                        end_date = end_date.replace(hour=23, minute=59, second=59) # Căn đến cuối ngày của tuần đó
+                        end_date = end_date.replace(hour=23, minute=59, second=59) 
                         
-                        # Nếu hôm nay nằm trong tuần này -> Bấm chọn luôn!
                         if start_date <= today <= end_date:
                             print(f"✅ Đã tìm thấy tuần hiện tại: {text.replace(chr(10), ' ')}")
                             row.click()
                             found_week = True
-                            page.wait_for_timeout(3000) # Đợi web load lịch mới
                             break
                 
                 if not found_week:
-                    print("⚠️ Không tìm thấy ngày hôm nay trong danh sách. Có thể đang nghỉ hè/lễ. Chụp tuần mặc định.")
-                    page.keyboard.press('Escape') # Ấn Esc để đóng menu thả xuống
+                    print("⚠️ Chú ý: Không tìm thấy tuần chứa ngày hôm nay (Có thể web trường đang hiển thị học kỳ cũ).")
+                    print("👉 Bot sẽ bấm Escape để đóng menu và chụp tuần mặc định trên màn hình.")
+                    page.keyboard.press('Escape')
             
             except Exception as e:
-                print(f"⚠️ Lỗi lúc chọn tuần (nhưng vẫn sẽ chụp): {e}")
+                print(f"⚠️ Gặp lỗi nhỏ lúc chọn tuần (nhưng bot vẫn sẽ tiếp tục chụp ảnh): {e}")
+            
+            # Đợi 3 giây cho lịch tải xong, dù có chuyển tuần hay không
+            page.wait_for_timeout(3000)
             # ---------------------------------
             
             print("📸 BƯỚC 6: Đang chụp ảnh lịch học...")
@@ -110,7 +111,7 @@ def send_telegram_photo(photo_path):
         with open(photo_path, 'rb') as photo:
             payload = {
                 "chat_id": chat_id,
-                "caption": "📌 Lịch học chuẩn đét tuần này của sếp đây! Chúc code vui vẻ nhé! 💻"
+                "caption": "📌 Lịch học của sếp đây! (Nếu sai tuần là do web trường chưa cập nhật học kỳ nhé) 💻"
             }
             files = {
                 "photo": photo
