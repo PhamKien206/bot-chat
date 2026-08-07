@@ -68,7 +68,6 @@ def scrape_data():
             except Exception:
                 pass 
             
-            # Đợi 5 giây cho chắc lịch học đã load
             page.wait_for_timeout(5000)
             table_locator_hoc = page.locator('.table-bordered:visible').first
             page.wait_for_selector('.table-bordered:visible', timeout=30000)
@@ -76,31 +75,77 @@ def scrape_data():
             table_locator_hoc.screenshot(path=ket_qua["anh_lich_hoc"])
             print("✅ Đã chụp xong lịch học!")
 
-            # ================= 2. QUÉT LỊCH THI =================
-            print("📝 BƯỚC 3: Kiểm tra Lịch thi...")
+            # ================= 2. QUÉT LỊCH THI (RADAR QUÉT SÂU) =================
+            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Kích hoạt Radar quét sâu)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
+            page.wait_for_timeout(5000) 
+            
+            co_lich_thi = False
+            khung_chinh = page.locator('.page-content').first
             
             try:
-                print("⏳ Đang kiên nhẫn đợi web tải Lịch thi (30 GIÂY)...")
-                # Đợi cứng 30 giây để đảm bảo 100% web đã xổ hết dữ liệu ra
-                page.wait_for_timeout(30000) 
+                print("⏳ Đang lục lọi các Học kỳ gần nhất và kỳ Hè để tìm lịch...")
                 
-                khung_chinh = page.locator('.page-content').first
-                noi_dung_thi = khung_chinh.inner_text()
+                # Check mặc định trước
+                noi_dung = khung_chinh.inner_text()
+                if "Ngày thi" in noi_dung and "Không tìm thấy" not in noi_dung and "Không có" not in noi_dung:
+                    co_lich_thi = True
                 
-                if "Ngày thi" in noi_dung_thi and "Ca thi" in noi_dung_thi:
-                    print(f"🚨 PHÁT HIỆN LỊCH THI! Đang chụp ảnh...")
-                    ket_qua["anh_lich_thi"] = "anh_lich_thi.png"
-                    
-                    vung_chup = page.locator('.portlet-body').last
-                    if not vung_chup.is_visible():
-                        vung_chup = khung_chinh
-                        
-                    vung_chup.screenshot(path=ket_qua["anh_lich_thi"])
-                else:
-                    print("✅ Hiện tại chưa có lịch thi mới.")
+                # Nếu mặc định không có, bắt đầu click tìm kiếm
+                if not co_lich_thi:
+                    dropdowns = page.locator('.ui-select-match')
+                    if dropdowns.count() >= 2:
+                        # Vòng lặp 1: Check 2 học kỳ năm học gần nhất
+                        for i in range(2): 
+                            if co_lich_thi: break
+                            
+                            try:
+                                dropdowns.nth(0).click(timeout=3000)
+                                page.wait_for_timeout(1000)
+                                opts_1 = page.locator('.ui-select-choices-row:visible')
+                                if opts_1.count() > i:
+                                    opts_1.nth(i).click()
+                                    page.wait_for_timeout(3000)
+                                else:
+                                    page.keyboard.press('Escape')
+                            except:
+                                page.keyboard.press('Escape')
+
+                            # Vòng lặp 2: Check lần lượt Học kỳ chính và Học kỳ hè
+                            for j in range(2): 
+                                if co_lich_thi: break
+                                
+                                try:
+                                    dropdowns.nth(1).click(timeout=3000)
+                                    page.wait_for_timeout(1000)
+                                    opts_2 = page.locator('.ui-select-choices-row:visible')
+                                    if opts_2.count() > j:
+                                        opts_2.nth(j).click()
+                                        page.wait_for_timeout(4000) # Đợi web load bảng mới
+                                        
+                                        # Soi xem có lịch thi Hè không
+                                        noi_dung_moi = khung_chinh.inner_text()
+                                        if "Ngày thi" in noi_dung_moi and "Không tìm thấy" not in noi_dung_moi and "Không có" not in noi_dung_moi:
+                                            co_lich_thi = True
+                                            print(f"✅ Đã lôi được lịch thi đang giấu ra ngoài!")
+                                    else:
+                                        page.keyboard.press('Escape')
+                                except:
+                                    page.keyboard.press('Escape')
+
             except Exception as e:
-                print("⚠️ Lỗi quét lịch thi:", e)
+                print("⚠️ Lỗi trong quá trình quét sâu:", e)
+
+            # Nếu lôi được lịch thi ra thì chụp
+            if co_lich_thi:
+                print(f"🚨 PHÁT HIỆN LỊCH THI! Đang chụp ảnh...")
+                ket_qua["anh_lich_thi"] = "anh_lich_thi.png"
+                vung_chup = page.locator('.portlet-body').last
+                if not vung_chup.is_visible():
+                    vung_chup = khung_chinh
+                vung_chup.screenshot(path=ket_qua["anh_lich_thi"])
+            else:
+                print("✅ Đã lật tung các học kỳ nhưng chưa có lịch thi mới.")
 
             # ================= 3. KIỂM TRA HỌC PHÍ =================
             print("💰 BƯỚC 4: Tra cứu Học phí...")
@@ -108,7 +153,6 @@ def scrape_data():
             
             try:
                 print("⏳ Đang kiên nhẫn đợi dữ liệu tiền học load (TỐI ĐA 30 GIÂY)...")
-                # Nâng thời gian đứng rình chữ đỏ lên 30 giây
                 tien_no_locator = page.wait_for_selector('strong.font-red', timeout=30000)
                 
                 chuoi_tien_no = tien_no_locator.inner_text().strip()
