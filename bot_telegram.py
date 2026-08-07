@@ -80,7 +80,7 @@ def scrape_data():
             print("✅ Đã chụp xong lịch học!")
 
             # ================= 2. QUÉT LỊCH THI =================
-            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Thuật toán Bắn Tỉa Tên Gọi)...")
+            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Bộ lọc Thời gian Thông minh)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
             
             print("⏳ Đợi 10s cho trang Lịch thi khởi động...")
@@ -100,6 +100,7 @@ def scrape_data():
                             for ngay_str in cac_ngay_thi:
                                 try:
                                     ngay_thi = datetime.strptime(ngay_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
+                                    # Nếu lịch thi lớn hơn hoặc bằng hôm nay -> Chốt!
                                     if ngay_thi >= hom_nay:
                                         print(f"👉 Chốt đơn môn thi sắp tới: {ngay_str}")
                                         return True
@@ -116,68 +117,79 @@ def scrape_data():
                     co_lich_thi = True
                 
                 if not co_lich_thi:
-                    for i in range(4): # Lùi 4 năm học
-                        if co_lich_thi: break
+                    print("⏳ Đang ép bot đứng đợi các ô Dropdown hiện ra...")
+                    try:
+                        # Ép đợi 15 giây cho ô dropdown xuất hiện rồi mới đếm
+                        page.wait_for_selector('.page-content .ui-select-match', timeout=15000)
+                    except:
+                        pass
                         
-                        print(f"🔍 Đang lục lọi Năm học thứ {i+1}...")
-                        try:
-                            dropdowns = page.locator('.page-content .ui-select-match')
-                            if dropdowns.count() < 2:
-                                continue
-                                
-                            # Mở Năm học
-                            dropdowns.nth(0).click(timeout=5000)
-                            page.wait_for_timeout(1000) 
+                    dropdowns = page.locator('.page-content .ui-select-match')
+                    so_luong_o = dropdowns.count()
+                    print(f"👉 Tìm thấy {so_luong_o} ô chọn trên màn hình!")
+                    
+                    if so_luong_o >= 2:
+                        for i in range(4): # Lùi 4 năm học
+                            if co_lich_thi: break
                             
-                            menu_mo = page.locator('.ui-select-container.open .ui-select-choices-row')
-                            if menu_mo.count() > i:
-                                menu_mo.nth(i).click(timeout=5000)
-                                page.wait_for_timeout(10000) # Chờ API
-                            else:
-                                page.keyboard.press('Escape')
-                                break 
-                            
-                            # TUYỆT CHIÊU BẮN TỈA: Thay vì chọn 0,1,2, ta đi tìm chính xác tên Loại kỳ thi
-                            cac_loai_can_tim = ["Học kỳ chính", "Học kỳ hè"]
-                            
-                            for loai_ten in cac_loai_can_tim:
-                                if co_lich_thi: break
+                            print(f"🔍 Đang lục lọi Năm học thứ {i+1}...")
+                            try:
+                                # Mở Năm học
+                                dropdowns.nth(0).click(timeout=5000)
+                                page.wait_for_timeout(2000) 
                                 
-                                print(f"   👉 Bắn tỉa mục tiêu: '{loai_ten}'")
-                                dropdowns.nth(1).click(timeout=5000)
-                                page.wait_for_timeout(1000)
-                                
-                                # Quét tìm dòng chứa đúng chữ "Học kỳ chính" hoặc "Học kỳ hè"
-                                option_muc_tieu = page.locator('.ui-select-container.open .ui-select-choices-row').filter(has_text=loai_ten).first
-                                
-                                if option_muc_tieu.is_visible():
-                                    option_muc_tieu.click(timeout=5000)
+                                menu_mo = page.locator('.ui-select-container.open .ui-select-choices-row')
+                                if menu_mo.count() > i:
+                                    menu_mo.nth(i).click(timeout=5000)
+                                    print(f"   ⏳ Đợi 10s cho dữ liệu Năm học load...")
                                     page.wait_for_timeout(10000) 
-                                    
-                                    # Nếu có ô Đợt thi (ô số 3), bấm chọn đợt mới nhất cho chắc kèo
-                                    dropdowns_lai = page.locator('.page-content .ui-select-match')
-                                    if dropdowns_lai.count() >= 3:
-                                        print("   👉 Đang cố định Đợt thi mới nhất...")
-                                        dropdowns_lai.nth(2).click(timeout=5000)
-                                        page.wait_for_timeout(1000)
-                                        dot_options = page.locator('.ui-select-container.open .ui-select-choices-row')
-                                        if dot_options.count() > 0:
-                                            dot_options.nth(0).click(timeout=5000)
-                                            page.wait_for_timeout(10000)
-                                        else:
-                                            page.keyboard.press('Escape')
-
-                                    # Lôi ra check ngày tháng
-                                    if kiem_tra_co_lich_tuong_lai():
-                                        co_lich_thi = True
-                                        print(f"✅ HOÀN HẢO! Đã moi ra lịch thi chuẩn rồi sếp ơi!")
-                                        break
                                 else:
                                     page.keyboard.press('Escape')
+                                    break 
+                                
+                                # Bắn tỉa tên gọi
+                                cac_loai_can_tim = ["Học kỳ chính", "Học kỳ hè"]
+                                
+                                for loai_ten in cac_loai_can_tim:
+                                    if co_lich_thi: break
                                     
-                        except Exception as e:
-                            page.keyboard.press('Escape')
-                            pass
+                                    print(f"   👉 Bắn tỉa mục tiêu: '{loai_ten}'")
+                                    dropdowns.nth(1).click(timeout=5000)
+                                    page.wait_for_timeout(2000)
+                                    
+                                    option_muc_tieu = page.locator('.ui-select-container.open .ui-select-choices-row').filter(has_text=loai_ten).first
+                                    
+                                    if option_muc_tieu.is_visible():
+                                        option_muc_tieu.click(timeout=5000)
+                                        print(f"   ⏳ Đợi 10s cho bảng '{loai_ten}' load...")
+                                        page.wait_for_timeout(10000) 
+                                        
+                                        # Nếu có ô Đợt thi (ô số 3), bấm đợt mới nhất
+                                        if dropdowns.count() >= 3:
+                                            print("   👉 Đang cố định Đợt thi mới nhất...")
+                                            dropdowns.nth(2).click(timeout=5000)
+                                            page.wait_for_timeout(2000)
+                                            dot_options = page.locator('.ui-select-container.open .ui-select-choices-row')
+                                            if dot_options.count() > 0:
+                                                dot_options.nth(0).click(timeout=5000)
+                                                print("   ⏳ Đợi 10s cho Đợt thi load...")
+                                                page.wait_for_timeout(10000)
+                                            else:
+                                                page.keyboard.press('Escape')
+
+                                        # Kiểm tra lại xem bảng vừa load có lịch chuẩn không
+                                        if kiem_tra_co_lich_tuong_lai():
+                                            co_lich_thi = True
+                                            print(f"✅ HOÀN HẢO! Đã moi ra lịch thi chuẩn rồi sếp ơi!")
+                                            break
+                                    else:
+                                        page.keyboard.press('Escape')
+                                        
+                            except Exception as e:
+                                page.keyboard.press('Escape')
+                                pass
+                    else:
+                        print("⚠️ Lỗi: Không đếm đủ ô dropdown, có thể web bị lag!")
 
             except Exception as e:
                 print("⚠️ Lỗi tổng thể quá trình quét:", e)
@@ -200,8 +212,9 @@ def scrape_data():
             page.goto('https://sinhvien1.tlu.edu.vn/#/student_voucher_receive_pay/listing', timeout=60000)
             
             try:
-                print("⏳ Đợi 10s cho dữ liệu tiền học load xong hoàn toàn...")
-                page.wait_for_timeout(10000)
+                # Ép bot đứng yên 15 GIÂY cho tiền nợ kịp chui ra
+                print("⏳ Đợi 15s cho dữ liệu tiền học load xong hoàn toàn...")
+                page.wait_for_timeout(15000)
                 
                 tien_no_locator = page.wait_for_selector('strong.font-red', timeout=20000)
                 
@@ -216,7 +229,7 @@ def scrape_data():
                 else:
                     print("✅ Số nợ = 0. Đã đóng đủ tiền!")
             except Exception as e:
-                print("✅ Đã kiểm tra xong: Không tìm thấy khoản nợ (Đã đóng đủ tiền).")
+                print("✅ Đã đợi mỏi mòn không thấy khoản nợ. Sếp đã đóng đủ tiền!")
 
             # ================= KẾT THÚC =================
             browser.close()
