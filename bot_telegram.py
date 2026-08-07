@@ -181,7 +181,7 @@ def scrape_data():
                 
                 if so_tien > 0:
                     print(f"🚨 CẢNH BÁO: Đang nợ {chuoi_tien_no} VNĐ!")
-                    ket_qua["tin_nhan_hoc_phi"] = f"🚨 CẢNH BÁO HỌC PHÍ: Sếp đang còn nợ {chuoi_tien_no} VNĐ. Nhớ đóng sớm kẻo bị cấm thi nhé! 💸"
+                    ket_qua["tin_nhan_hoc_phi"] = f"🚨 CẢNH BÁO HỌC PHÍ:{chuoi_tien_no} VNĐ. "
                     ket_qua["anh_hoc_phi"] = "anh_hoc_phi.png"
                     page.locator('.portlet-body').first.screenshot(path=ket_qua["anh_hoc_phi"])
                 else:
@@ -219,10 +219,10 @@ if __name__ == "__main__":
     du_lieu = scrape_data()
     
     if du_lieu.get("anh_lich_hoc"):
-        send_telegram_photo(du_lieu["anh_lich_hoc"], "📌 Lịch học tuần này của sếp! Chúc code vui vẻ! 💻")
+        send_telegram_photo(du_lieu["anh_lich_hoc"], "📌 Lịch học tuần này ")
         
     if du_lieu.get("anh_lich_thi"):
-        send_telegram_photo(du_lieu["anh_lich_thi"], "🚨 ĐÃ CÓ LỊCH THI KỲ HÈ/KỲ CŨ! Sếp lưu ảnh lại chuẩn bị ôn bài nhé! 📝🔥")
+        send_telegram_photo(du_lieu["anh_lich_thi"], "🚨 ĐÃ CÓ LỊCH THI ")
 
     if du_lieu.get("anh_hoc_phi"):
         send_telegram_photo(du_lieu["anh_hoc_phi"], du_lieu["tin_nhan_hoc_phi"])
