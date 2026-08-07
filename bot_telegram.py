@@ -68,9 +68,10 @@ def scrape_data():
             except Exception:
                 pass 
             
-            page.wait_for_timeout(3000)
+            # Đợi 5 giây cho chắc lịch học đã load
+            page.wait_for_timeout(5000)
             table_locator_hoc = page.locator('.table-bordered:visible').first
-            page.wait_for_selector('.table-bordered:visible', timeout=15000)
+            page.wait_for_selector('.table-bordered:visible', timeout=30000)
             ket_qua["anh_lich_hoc"] = "anh_lich_hoc.png"
             table_locator_hoc.screenshot(path=ket_qua["anh_lich_hoc"])
             print("✅ Đã chụp xong lịch học!")
@@ -80,33 +81,35 @@ def scrape_data():
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
             
             try:
-                # Đợi cái bảng bất kỳ xuất hiện (không ép buộc phải là .table-bordered nữa)
-                page.wait_for_selector('table:visible', timeout=15000)
-                bang_lich_thi = page.locator('table:visible').first
+                print("⏳ Đang kiên nhẫn đợi web tải Lịch thi (30 GIÂY)...")
+                # Đợi cứng 30 giây để đảm bảo 100% web đã xổ hết dữ liệu ra
+                page.wait_for_timeout(30000) 
                 
-                # Chờ thêm 2 giây cho Angular render chữ vào bảng
-                page.wait_for_timeout(2000)
+                khung_chinh = page.locator('.page-content').first
+                noi_dung_thi = khung_chinh.inner_text()
                 
-                noi_dung_bang = bang_lich_thi.inner_text()
-                so_dong = bang_lich_thi.locator('tbody tr').count()
-                
-                if "Không tìm thấy" in noi_dung_bang or "Không có" in noi_dung_bang or so_dong == 0:
-                    print("✅ Chưa có lịch thi.")
-                else:
+                if "Ngày thi" in noi_dung_thi and "Ca thi" in noi_dung_thi:
                     print(f"🚨 PHÁT HIỆN LỊCH THI! Đang chụp ảnh...")
                     ket_qua["anh_lich_thi"] = "anh_lich_thi.png"
-                    bang_lich_thi.screenshot(path=ket_qua["anh_lich_thi"])
+                    
+                    vung_chup = page.locator('.portlet-body').last
+                    if not vung_chup.is_visible():
+                        vung_chup = khung_chinh
+                        
+                    vung_chup.screenshot(path=ket_qua["anh_lich_thi"])
+                else:
+                    print("✅ Hiện tại chưa có lịch thi mới.")
             except Exception as e:
-                print("⚠️ Bỏ qua quét lịch thi (có thể do bảng trống):", e)
+                print("⚠️ Lỗi quét lịch thi:", e)
 
             # ================= 3. KIỂM TRA HỌC PHÍ =================
             print("💰 BƯỚC 4: Tra cứu Học phí...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student_voucher_receive_pay/listing', timeout=60000)
             
             try:
-                # Ép bot phải kiên nhẫn đứng đợi TỐI ĐA 15 GIÂY xem chữ đỏ có xuất hiện không
-                print("⏳ Đang kiên nhẫn đợi dữ liệu tiền học load...")
-                tien_no_locator = page.wait_for_selector('strong.font-red', timeout=15000)
+                print("⏳ Đang kiên nhẫn đợi dữ liệu tiền học load (TỐI ĐA 30 GIÂY)...")
+                # Nâng thời gian đứng rình chữ đỏ lên 30 giây
+                tien_no_locator = page.wait_for_selector('strong.font-red', timeout=30000)
                 
                 chuoi_tien_no = tien_no_locator.inner_text().strip()
                 so_tien = int(chuoi_tien_no.replace(',', '').replace('.', ''))
@@ -119,8 +122,7 @@ def scrape_data():
                 else:
                     print("✅ Số nợ = 0. Đã đóng đủ tiền!")
             except Exception as e:
-                # Nếu đợi 15 giây mà không thấy chữ đỏ, chứng tỏ web đã load xong và bạn không nợ
-                print("✅ Không tìm thấy khoản nợ (Đã đóng đủ tiền).")
+                print("✅ Đã đợi 30s không thấy khoản nợ (Đã đóng đủ tiền).")
 
             # ================= KẾT THÚC =================
             browser.close()
