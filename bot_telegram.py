@@ -32,7 +32,7 @@ def scrape_data():
             page.click('button:has-text("Đăng nhập")') 
             page.wait_for_load_state('networkidle')
 
-            # ================= 1. CÀO LỊCH HỌC =================
+            #  1. CÀO LỊCH HỌC 
             print("📅 BƯỚC 2: Vào trang Lịch học...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
             
@@ -79,7 +79,7 @@ def scrape_data():
             table_locator_hoc.screenshot(path=ket_qua["anh_lich_hoc"])
             print("✅ Đã chụp xong lịch học!")
 
-            # ================= 2. QUÉT LỊCH THI =================
+            #  2. QUÉT LỊCH THI 
             print("📝 BƯỚC 3: Kiểm tra Lịch thi (Bộ lọc Thời gian Thông minh)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
             
@@ -207,7 +207,7 @@ def scrape_data():
             else:
                 print("✅ Đã kiểm tra không bỏ sót ngóc ngách nào. Sếp có thể kê cao gối ngủ!")
 
-            # ================= 3. KIỂM TRA HỌC PHÍ =================
+            # 3. KIỂM TRA HỌC PHÍ 
             print("💰 BƯỚC 4: Tra cứu Học phí...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/student_voucher_receive_pay/listing', timeout=60000)
             
@@ -231,7 +231,7 @@ def scrape_data():
             except Exception as e:
                 print("✅ Đã đợi mỏi mòn không thấy khoản nợ. Sếp đã đóng đủ tiền!")
 
-            # ================= KẾT THÚC =================
+            # KẾT THÚC 
             browser.close()
             return ket_qua
 
