@@ -80,7 +80,7 @@ def scrape_data():
             print("✅ Đã chụp xong lịch học!")
 
             # ================= 2. QUÉT LỊCH THI =================
-            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Bộ lọc Thời gian Thông minh)...")
+            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Thuật toán Bắn Tỉa Tên Gọi)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
             
             print("⏳ Đợi 10s cho trang Lịch thi khởi động...")
@@ -88,7 +88,6 @@ def scrape_data():
             
             co_lich_thi = False
             vn_tz = timezone(timedelta(hours=7))
-            # Lấy mốc thời gian là 00:00:00 ngày hôm nay để so sánh
             hom_nay = datetime.now(vn_tz).replace(hour=0, minute=0, second=0, microsecond=0)
             
             def kiem_tra_co_lich_tuong_lai():
@@ -97,79 +96,95 @@ def scrape_data():
                     if so_dong > 0:
                         chu_trong_bang = page.locator('.page-content table').inner_text()
                         if "Không tìm thấy" not in chu_trong_bang and "Không có" not in chu_trong_bang:
-                            # Trích xuất toàn bộ ngày tháng có định dạng dd/mm/yyyy trong bảng
                             cac_ngay_thi = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})', chu_trong_bang)
-                            
-                            # Kiểm tra xem có ngày nào lớn hơn hoặc bằng hôm nay không
                             for ngay_str in cac_ngay_thi:
                                 try:
                                     ngay_thi = datetime.strptime(ngay_str, '%d/%m/%Y').replace(tzinfo=vn_tz)
                                     if ngay_thi >= hom_nay:
-                                        print(f"👉 Tìm thấy môn thi sắp tới vào ngày: {ngay_str}")
+                                        print(f"👉 Chốt đơn môn thi sắp tới: {ngay_str}")
                                         return True
                                 except:
                                     pass
-                            print("⚠️ Bảng này toàn lịch thi cũ trong quá khứ, bỏ qua!")
+                            print("⚠️ Bảng này toàn lịch thi cũ trong quá khứ, vứt!")
                 except:
                     pass
                 return False
 
             try:
-                print("⏳ Đang lục lọi tìm Lịch thi MỚI NHẤT...")
-                
-                # 1. Soi màn hình mặc định trước
+                print("⏳ Đang soi màn hình mặc định xem có sẵn không...")
                 if kiem_tra_co_lich_tuong_lai():
                     co_lich_thi = True
                 
-                # 2. Lật tung các học kỳ nếu màn hình mặc định không có lịch tương lai
                 if not co_lich_thi:
-                    for i in range(4): 
+                    for i in range(4): # Lùi 4 năm học
                         if co_lich_thi: break
                         
-                        for j in range(3): 
-                            print(f"🔍 Đang soi Năm học thứ {i+1}, Loại học kỳ thứ {j+1}...")
-                            try:
-                                dropdowns = page.locator('.page-content .ui-select-match')
-                                if dropdowns.count() < 2:
-                                    continue
-                                    
-                                dropdowns.nth(0).click(timeout=3000)
-                                page.wait_for_timeout(1000) 
+                        print(f"🔍 Đang lục lọi Năm học thứ {i+1}...")
+                        try:
+                            dropdowns = page.locator('.page-content .ui-select-match')
+                            if dropdowns.count() < 2:
+                                continue
                                 
-                                menu_mo = page.locator('.ui-select-container.open .ui-select-choices-row')
-                                if menu_mo.count() > i:
-                                    menu_mo.nth(i).click(timeout=3000)
-                                    page.wait_for_timeout(10000) 
-                                else:
-                                    page.keyboard.press('Escape')
-                                    break 
+                            # Mở Năm học
+                            dropdowns.nth(0).click(timeout=5000)
+                            page.wait_for_timeout(1000) 
+                            
+                            menu_mo = page.locator('.ui-select-container.open .ui-select-choices-row')
+                            if menu_mo.count() > i:
+                                menu_mo.nth(i).click(timeout=5000)
+                                page.wait_for_timeout(10000) # Chờ API
+                            else:
+                                page.keyboard.press('Escape')
+                                break 
+                            
+                            # TUYỆT CHIÊU BẮN TỈA: Thay vì chọn 0,1,2, ta đi tìm chính xác tên Loại kỳ thi
+                            cac_loai_can_tim = ["Học kỳ chính", "Học kỳ hè"]
+                            
+                            for loai_ten in cac_loai_can_tim:
+                                if co_lich_thi: break
                                 
-                                dropdowns.nth(1).click(timeout=3000)
+                                print(f"   👉 Bắn tỉa mục tiêu: '{loai_ten}'")
+                                dropdowns.nth(1).click(timeout=5000)
                                 page.wait_for_timeout(1000)
                                 
-                                menu_mo_2 = page.locator('.ui-select-container.open .ui-select-choices-row')
-                                if menu_mo_2.count() > j:
-                                    menu_mo_2.nth(j).click(timeout=3000)
+                                # Quét tìm dòng chứa đúng chữ "Học kỳ chính" hoặc "Học kỳ hè"
+                                option_muc_tieu = page.locator('.ui-select-container.open .ui-select-choices-row').filter(has_text=loai_ten).first
+                                
+                                if option_muc_tieu.is_visible():
+                                    option_muc_tieu.click(timeout=5000)
                                     page.wait_for_timeout(10000) 
                                     
-                                    # Dùng bộ lọc tương lai để chốt hạ
+                                    # Nếu có ô Đợt thi (ô số 3), bấm chọn đợt mới nhất cho chắc kèo
+                                    dropdowns_lai = page.locator('.page-content .ui-select-match')
+                                    if dropdowns_lai.count() >= 3:
+                                        print("   👉 Đang cố định Đợt thi mới nhất...")
+                                        dropdowns_lai.nth(2).click(timeout=5000)
+                                        page.wait_for_timeout(1000)
+                                        dot_options = page.locator('.ui-select-container.open .ui-select-choices-row')
+                                        if dot_options.count() > 0:
+                                            dot_options.nth(0).click(timeout=5000)
+                                            page.wait_for_timeout(10000)
+                                        else:
+                                            page.keyboard.press('Escape')
+
+                                    # Lôi ra check ngày tháng
                                     if kiem_tra_co_lich_tuong_lai():
                                         co_lich_thi = True
-                                        print(f"✅ BẮT ĐƯỢC RỒI! Lịch thi chuẩn đã hiện nguyên hình!")
+                                        print(f"✅ HOÀN HẢO! Đã moi ra lịch thi chuẩn rồi sếp ơi!")
                                         break
                                 else:
                                     page.keyboard.press('Escape')
                                     
-                            except Exception as e:
-                                page.keyboard.press('Escape')
-                                pass
+                        except Exception as e:
+                            page.keyboard.press('Escape')
+                            pass
 
             except Exception as e:
-                print("⚠️ Lỗi tổng thể quá trình quét ma trận:", e)
+                print("⚠️ Lỗi tổng thể quá trình quét:", e)
 
-            # 3. Chụp ảnh nếu lôi được lịch ra
+            # 3. Chụp ảnh
             if co_lich_thi:
-                print(f"🚨 PHÁT HIỆN LỊCH THI MỚI! Đang chụp ảnh...")
+                print(f"🚨 Đang nháy máy chụp ảnh Lịch thi...")
                 ket_qua["anh_lich_thi"] = "anh_lich_thi.png"
                 
                 vung_chup = page.locator('.portlet-body').last
@@ -178,7 +193,7 @@ def scrape_data():
                     
                 vung_chup.screenshot(path=ket_qua["anh_lich_thi"])
             else:
-                print("✅ Đã kiểm tra sạch sẽ. Hiện tại sếp không có lịch thi nào sắp tới!")
+                print("✅ Đã kiểm tra không bỏ sót ngóc ngách nào. Sếp có thể kê cao gối ngủ!")
 
             # ================= 3. KIỂM TRA HỌC PHÍ =================
             print("💰 BƯỚC 4: Tra cứu Học phí...")
@@ -195,7 +210,7 @@ def scrape_data():
                 
                 if so_tien > 0:
                     print(f"🚨 CẢNH BÁO: Đang nợ {chuoi_tien_no} VNĐ!")
-                    ket_qua["tin_nhan_hoc_phi"] = f"🚨 CẢNH BÁO HỌC PHÍ: {chuoi_tien_no} VNĐ"
+                    ket_qua["tin_nhan_hoc_phi"] = f"🚨 CẢNH BÁO HỌC PHÍ: Sếp đang còn nợ {chuoi_tien_no} VNĐ. Nhớ đóng sớm kẻo bị cấm thi nhé! 💸"
                     ket_qua["anh_hoc_phi"] = "anh_hoc_phi.png"
                     page.locator('.portlet-body').first.screenshot(path=ket_qua["anh_hoc_phi"])
                 else:
@@ -233,10 +248,10 @@ if __name__ == "__main__":
     du_lieu = scrape_data()
     
     if du_lieu.get("anh_lich_hoc"):
-        send_telegram_photo(du_lieu["anh_lich_hoc"], "📌 Lịch học tuần này ")
+        send_telegram_photo(du_lieu["anh_lich_hoc"], "📌 Lịch học tuần này của sếp! Chúc code vui vẻ! 💻")
         
     if du_lieu.get("anh_lich_thi"):
-        send_telegram_photo(du_lieu["anh_lich_thi"], "🚨 ĐÃ CÓ LỊCH THI MỚI")
+        send_telegram_photo(du_lieu["anh_lich_thi"], "🚨 ĐÃ CÓ LỊCH THI MỚI! Sếp lưu ảnh lại chuẩn bị ôn bài nhé! 📝🔥")
 
     if du_lieu.get("anh_hoc_phi"):
         send_telegram_photo(du_lieu["anh_hoc_phi"], du_lieu["tin_nhan_hoc_phi"])
