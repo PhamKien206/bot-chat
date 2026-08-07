@@ -10,7 +10,7 @@ Vào **Settings** > **Secrets and variables** > **Actions** > Bấm **New reposi
 | :--- | :--- |
 | `MSV` | Mã sinh viên |
 | `PASS_TRUONG` | Mật khẩu web trường |
-|`Ở Telegram`| |`search`|
+|`Ở Telegram`| `search`|
 | `TELE_BOT_TOKEN` | Token lấy từ `@BotFather` |
 | `TELE_CHAT_ID` | Chat ID lấy từ `@userinfobot` |
 
