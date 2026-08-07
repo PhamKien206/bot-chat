@@ -75,8 +75,8 @@ def scrape_data():
             table_locator_hoc.screenshot(path=ket_qua["anh_lich_hoc"])
             print("✅ Đã chụp xong lịch học!")
 
-            # ================= 2. QUÉT LỊCH THI (MA TRẬN 3x3) =================
-            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Kích hoạt Ma trận quét sâu)...")
+            # ================= 2. QUÉT LỊCH THI (MA TRẬN QUÉT SÂU V2) =================
+            print("📝 BƯỚC 3: Kiểm tra Lịch thi (Kích hoạt Ma trận quét sâu V2)...")
             page.goto('https://sinhvien1.tlu.edu.vn/#/search_exam_room_student/listing', timeout=60000)
             page.wait_for_timeout(5000) 
             
@@ -84,64 +84,64 @@ def scrape_data():
             khung_chinh = page.locator('.page-content').first
             
             try:
-                print("⏳ Đang dò tìm 9 tổ hợp Năm học & Học kỳ (Chính/Hè) để lôi lịch thi ra...")
+                print("⏳ Đang lục lọi các Năm học & Học kỳ để lôi lịch thi ra...")
                 
-                # Check giao diện mặc định trước
+                # 1. Soi giao diện mặc định trước (nhỡ có sẵn)
                 noi_dung = khung_chinh.inner_text()
-                if "Ngày thi" in noi_dung and "Không tìm thấy" not in noi_dung and "Không có" not in noi_dung:
+                if "Ngày thi" in noi_dung and "Ca thi" in noi_dung and "Không tìm thấy" not in noi_dung and "Không có" not in noi_dung:
                     co_lich_thi = True
                 
-                # Nếu chưa có, bật chế độ click ma trận 3x3
+                # 2. Nếu chưa có, bật chế độ lật tung menu
                 if not co_lich_thi:
-                    # Tuyệt chiêu: Chỉ lấy dropdown nằm TRONG khung nội dung chính để không bấm nhầm
-                    dropdowns = khung_chinh.locator('.ui-select-match')
-                    
-                    if dropdowns.count() >= 2:
-                        for i in range(3): # Duyệt 3 năm học gần nhất
-                            if co_lich_thi: break
-                            
+                    for i in range(3): # Dò 3 Năm học gần nhất
+                        if co_lich_thi: break
+                        
+                        for j in range(2): # Dò 2 Học kỳ (Kỳ Chính = 0, Kỳ Hè = 1)
+                            print(f"🔍 Đang soi Năm học thứ {i+1}, Loại học kỳ thứ {j+1}...")
                             try:
-                                dropdowns.nth(0).click(timeout=3000)
-                                page.wait_for_timeout(1000)
-                                opts_nam = page.locator('.ui-select-choices-row:visible')
+                                # Mở ô Năm học
+                                o_nam_hoc = page.locator('.ui-select-match').nth(0)
+                                o_nam_hoc.click(timeout=3000)
+                                page.wait_for_timeout(1000) # Cho menu kịp hiện ra
                                 
-                                if opts_nam.count() > i:
-                                    opts_nam.nth(i).click()
-                                    page.wait_for_timeout(3000) 
+                                # Tuyệt chiêu: Lấy các dòng của cái menu ĐANG MỞ (class .open)
+                                menu_mo = page.locator('.ui-select-container.open .ui-select-choices-row')
+                                if menu_mo.count() > i:
+                                    menu_mo.nth(i).click(timeout=3000)
+                                    page.wait_for_timeout(2500) # Đợi web load dữ liệu
                                 else:
                                     page.keyboard.press('Escape')
-                                    break # Hết năm học
-                            except:
-                                page.keyboard.press('Escape')
-
-                            for j in range(3): # Duyệt 3 loại học kỳ (Kỳ 1, Kỳ 2, Kỳ Hè)
-                                if co_lich_thi: break
+                                    break # Không còn năm học cũ hơn, sang bước tiếp
                                 
-                                try:
-                                    dropdowns.nth(1).click(timeout=3000)
-                                    page.wait_for_timeout(1000)
-                                    opts_loai = page.locator('.ui-select-choices-row:visible')
+                                # Mở ô Học kỳ (Chính/Hè)
+                                o_hoc_ky = page.locator('.ui-select-match').nth(1)
+                                o_hoc_ky.click(timeout=3000)
+                                page.wait_for_timeout(1000)
+                                
+                                menu_mo_2 = page.locator('.ui-select-container.open .ui-select-choices-row')
+                                if menu_mo_2.count() > j:
+                                    menu_mo_2.nth(j).click(timeout=3000)
+                                    # Đợi 4 giây cho máy chủ tải xong cái bảng Lịch thi
+                                    page.wait_for_timeout(4000) 
                                     
-                                    if opts_loai.count() > j:
-                                        opts_loai.nth(j).click()
-                                        page.wait_for_timeout(4000) # Đợi web tải lại bảng lịch thi
-                                        
-                                        # Soi bảng xem có lịch không
-                                        noi_dung_moi = khung_chinh.inner_text()
-                                        if "Ngày thi" in noi_dung_moi and "Ca thi" in noi_dung_moi and "Không tìm thấy" not in noi_dung_moi and "Không có" not in noi_dung_moi:
-                                            co_lich_thi = True
-                                            print(f"✅ BẮT ĐƯỢC RỒI! Đã lôi được lịch thi đang giấu ở Học kỳ cũ/kỳ Hè ra ngoài!")
-                                            break
-                                    else:
-                                        page.keyboard.press('Escape')
+                                    # Soi bảng xem có lịch không
+                                    noi_dung_moi = khung_chinh.inner_text()
+                                    if "Ngày thi" in noi_dung_moi and "Ca thi" in noi_dung_moi and "Không tìm thấy" not in noi_dung_moi and "Không có" not in noi_dung_moi:
+                                        co_lich_thi = True
+                                        print(f"✅ BẮT ĐƯỢC RỒI! Đã moi được lịch thi đang giấu ở Học kỳ Hè / Kỳ cũ!")
                                         break
-                                except:
+                                else:
                                     page.keyboard.press('Escape')
+                                    
+                            except Exception as e:
+                                page.keyboard.press('Escape')
+                                # Lỗi nhấp chuột thì bỏ qua tổ hợp này, đi tiếp
+                                pass
 
             except Exception as e:
-                print("⚠️ Lỗi trong quá trình quét ma trận:", e)
+                print("⚠️ Lỗi tổng thể quá trình quét ma trận:", e)
 
-            # Chụp ảnh nếu lôi được lịch ra
+            # 3. Chụp ảnh nếu lôi được lịch ra
             if co_lich_thi:
                 print(f"🚨 PHÁT HIỆN LỊCH THI! Đang chụp ảnh...")
                 ket_qua["anh_lich_thi"] = "anh_lich_thi.png"
@@ -150,7 +150,7 @@ def scrape_data():
                     vung_chup = khung_chinh
                 vung_chup.screenshot(path=ket_qua["anh_lich_thi"])
             else:
-                print("✅ Đã lật tung 9 tổ hợp học kỳ nhưng hiện tại sếp không có lịch thi nào.")
+                print("✅ Đã lật tung mọi ngóc ngách nhưng hiện tại sếp không có lịch thi nào.")
 
             # ================= 3. KIỂM TRA HỌC PHÍ =================
             print("💰 BƯỚC 4: Tra cứu Học phí...")
