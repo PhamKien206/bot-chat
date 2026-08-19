@@ -1,2 +1,2 @@
-# Bot Lịch Học 
+# Bot Lịch Học, Học phí ,Lịch thi
 
