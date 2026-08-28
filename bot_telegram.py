@@ -24,12 +24,56 @@ def cho_on_dinh(page, selector, timeout=TIMEOUT_TABLE_LOAD, state='visible'):
     - Web nhanh -> chạy tiếp ngay, không phí thời gian chờ vô ích.
     - Web chậm -> vẫn chờ tới tối đa `timeout` thay vì fail sớm.
     Trả về True/False, KHÔNG raise exception để code gọi tự quyết định bước tiếp theo.
+    LƯU Ý: hàm này chỉ chờ phần tử XUẤT HIỆN/HIỂN THỊ, không đảm bảo NỘI DUNG bên trong
+    đã là dữ liệu mới nhất (ví dụ bảng cũ vẫn đang "visible" trong lúc chờ Angular load
+    dữ liệu mới). Nếu cần chờ nội dung đổi, dùng cho_noi_dung_doi() bên dưới.
     """
     try:
         page.wait_for_selector(selector, timeout=timeout, state=state)
         return True
     except PlaywrightTimeoutError:
         log(f"⚠️ Chờ '{selector}' quá {timeout / 1000:.0f}s mà chưa thấy, bỏ qua.")
+        return False
+
+
+def cho_danh_sach_on_dinh(page, selector, timeout=8000):
+    """
+    Chờ số lượng phần tử trong 1 danh sách (vd: các option của dropdown) không đổi
+    qua 2 lần đo liên tiếp. Angular ng-repeat có thể render dần dần, nếu đọc danh sách
+    quá sớm sẽ bị thiếu hoặc sai phần tử.
+    """
+    end_time = time.time() + timeout / 1000
+    last_count = -1
+    while time.time() < end_time:
+        current_count = page.locator(selector).count()
+        if current_count > 0 and current_count == last_count:
+            return True
+        last_count = current_count
+        page.wait_for_timeout(150)
+    return last_count > 0
+
+
+def cho_noi_dung_doi(page, selector, noi_dung_cu, timeout=TIMEOUT_TABLE_LOAD):
+    """
+    Chờ cho tới khi innerText của `selector` KHÁC với `noi_dung_cu`.
+    Dùng sau khi chọn 1 option mới (vd: đổi tuần) để chắc chắn bảng đã load dữ liệu
+    mới thật sự, tránh tình trạng chụp ảnh nhầm dữ liệu CŨ còn sót lại trên màn hình
+    (đây chính là nguyên nhân gây ra lỗi "chụp nhầm tuần").
+    """
+    if noi_dung_cu is None:
+        return True
+    try:
+        page.wait_for_function(
+            """({sel, old}) => {
+                const el = document.querySelector(sel);
+                return el && el.innerText !== old;
+            }""",
+            arg={"sel": selector, "old": noi_dung_cu},
+            timeout=timeout
+        )
+        return True
+    except PlaywrightTimeoutError:
+        log("⚠️ Nội dung bảng không đổi sau khi chọn lại (có thể do dữ liệu 2 tuần trùng nhau).")
         return False
 
 
@@ -44,7 +88,7 @@ def chon_dropdown(page, index, wait_selector_after, text_loc=None, index_option=
         dropdowns.nth(index).click(timeout=TIMEOUT_CLICK)
         page.wait_for_timeout(WAIT_AFTER_SELECT)
 
-        cho_on_dinh(page, '.ui-select-container.open .ui-select-choices-row', timeout=5000)
+        cho_danh_sach_on_dinh(page, '.ui-select-container.open .ui-select-choices-row', timeout=5000)
         options = page.locator('.ui-select-container.open .ui-select-choices-row')
 
         opt = options.filter(has_text=text_loc).first if text_loc else options.nth(index_option)
@@ -74,7 +118,37 @@ def dang_nhap(page, msv, password):
     page.wait_for_load_state('networkidle', timeout=60000)
 
 
+def tuan_co_lich_hoc(page):
+    """
+    Kiểm tra bảng lịch học đang hiển thị có tiết học nào không.
+    Cấu trúc bảng: cột đầu tiên mỗi dòng là nhãn "Tiết X (giờ...)" nên LUÔN có chữ.
+    Các cột từ Thứ hai -> Chủ nhật chỉ có chữ khi có môn học được xếp lịch, còn không
+    thì trống. => Nếu tất cả các cột đó (từ cột thứ 2 trở đi) đều trống ở mọi dòng,
+    nghĩa là tuần này không có lịch học.
+    """
+    try:
+        rows = page.locator('.table-bordered:visible tbody tr').all()
+        if not rows:
+            return False
+        for row in rows:
+            cells = row.locator('td')
+            so_cot = cells.count()
+            for i in range(1, so_cot):  # bỏ qua cột đầu (cột "Tiết")
+                if cells.nth(i).inner_text().strip():
+                    return True
+        return False
+    except Exception as e:
+        log(f"⚠️ Lỗi khi kiểm tra bảng có lịch học không: {e}")
+        return True  # lỗi thì coi như CÓ lịch để không báo nhầm "được nghỉ"
+
+
 def cao_lich_hoc(page):
+    """
+    Trả về tuple (duong_dan_anh, tin_nhan):
+    - Nếu tuần này CÓ lịch học -> (path_anh, None)
+    - Nếu tuần này KHÔNG có lịch học -> (None, "tin nhắn báo nghỉ")
+    - Nếu lỗi không load được bảng -> (None, None)
+    """
     log("📅 BƯỚC 2: Vào trang Lịch học...")
     page.goto('https://sinhvien1.tlu.edu.vn/#/student/profile', timeout=60000)
 
@@ -82,30 +156,46 @@ def cao_lich_hoc(page):
     page.click('a:has-text("Bảng")')
     page.wait_for_timeout(WAIT_AFTER_SELECT)
 
+    tuan_dang_xem = None  # (start_date, end_date) của tuần mà mình chủ động chọn
+
     try:
         dropdown_tuan = page.locator('label').filter(has_text="Tuần").locator('..').locator('.ui-select-match')
         dropdown_tuan.click(timeout=TIMEOUT_CLICK)
-        cho_on_dinh(page, '.ui-select-choices-row', timeout=TIMEOUT_DROPDOWN)
+        cho_danh_sach_on_dinh(page, '.ui-select-choices-row', timeout=TIMEOUT_DROPDOWN)
 
-        today = datetime.now(VN_TZ)
+        # So sánh theo NGÀY thuần túy (bỏ giờ/phút) cho đơn giản và chắc chắn
+        today = datetime.now(VN_TZ).date()
         rows = page.locator('.ui-select-choices-row').all()
         found_week = False
+
+        # Lưu nội dung bảng HIỆN TẠI trước khi đổi tuần, để lát nữa biết khi nào
+        # bảng đã thực sự load dữ liệu mới (đây là điểm sửa quan trọng nhất).
+        try:
+            noi_dung_cu = page.locator('.table-bordered:visible').first.inner_text()
+        except Exception:
+            noi_dung_cu = None
 
         for row in rows:
             text = row.inner_text()
             match = re.search(r'\((\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\)', text)
-            if match:
-                start_str, end_str = match.groups()
-                start_date = datetime.strptime(start_str, '%d/%m/%Y').replace(tzinfo=VN_TZ)
-                end_date = datetime.strptime(end_str, '%d/%m/%Y').replace(tzinfo=VN_TZ)
-                end_date = end_date.replace(hour=23, minute=59, second=59)
+            if not match:
+                continue
 
-                if start_date <= today <= end_date:
-                    row.click()
-                    found_week = True
-                    break
+            start_str, end_str = match.groups()
+            start_date = datetime.strptime(start_str, '%d/%m/%Y').date()
+            end_date = datetime.strptime(end_str, '%d/%m/%Y').date()
+
+            if start_date <= today <= end_date:
+                row.click()
+                found_week = True
+                tuan_dang_xem = (start_date, end_date)
+                # ĐIỂM SỬA QUAN TRỌNG: chờ bảng đổi nội dung thật sự rồi mới đi tiếp,
+                # tránh chụp nhầm dữ liệu tuần cũ còn hiển thị trên màn hình.
+                cho_noi_dung_doi(page, '.table-bordered', noi_dung_cu, timeout=TIMEOUT_TABLE_LOAD)
+                break
 
         if not found_week:
+            log("⚠️ Không tìm thấy đúng tuần hiện tại trong danh sách, dùng tuần mặc định đang hiển thị.")
             page.keyboard.press('Escape')
     except Exception as e:
         log(f"⚠️ Không chọn được tuần hiện tại, dùng tuần mặc định: {e}")
@@ -113,12 +203,21 @@ def cao_lich_hoc(page):
     ok = cho_on_dinh(page, '.table-bordered:visible', timeout=TIMEOUT_TABLE_LOAD)
     if not ok:
         log("❌ Không load được bảng lịch học.")
-        return None
+        return None, None
+
+    if not tuan_co_lich_hoc(page):
+        if tuan_dang_xem:
+            s, e = tuan_dang_xem
+            khoang = f" ({s.strftime('%d/%m')} - {e.strftime('%d/%m')})"
+        else:
+            khoang = ""
+        log(f"🎉 Tuần này{khoang} không có lịch học - được nghỉ!")
+        return None, f"🎉 Tuần này{khoang} không có lịch học nào. Chúc bạn nghỉ ngơi vui vẻ!"
 
     path = "anh_lich_hoc.png"
     page.locator('.table-bordered:visible').first.screenshot(path=path)
     log("✅ Đã chụp xong lịch học!")
-    return path
+    return path, None
 
 
 def kiem_tra_co_lich_tuong_lai(page, hom_nay):
@@ -232,6 +331,7 @@ def kiem_tra_hoc_phi(page):
 def scrape_data_once(msv, password):
     ket_qua = {
         "anh_lich_hoc": None,
+        "tin_nhan_lich_hoc": "",
         "anh_lich_thi": None,
         "anh_hoc_phi": None,
         "tin_nhan_hoc_phi": ""
@@ -245,8 +345,13 @@ def scrape_data_once(msv, password):
 
         try:
             dang_nhap(page, msv, password)
-            ket_qua["anh_lich_hoc"] = cao_lich_hoc(page)
+
+            anh_lh, msg_lh = cao_lich_hoc(page)
+            ket_qua["anh_lich_hoc"] = anh_lh
+            ket_qua["tin_nhan_lich_hoc"] = msg_lh or ""
+
             ket_qua["anh_lich_thi"] = cao_lich_thi(page)
+
             anh_hp, msg_hp = kiem_tra_hoc_phi(page)
             ket_qua["anh_hoc_phi"] = anh_hp
             ket_qua["tin_nhan_hoc_phi"] = msg_hp
@@ -295,6 +400,20 @@ def send_telegram_photo(photo_path, caption, bot_token, chat_id):
         log(f"❌ Lỗi kết nối Telegram: {e}")
 
 
+def send_telegram_message(text, bot_token, chat_id):
+    """Gửi tin nhắn văn bản thuần (dùng khi không có ảnh để gửi, vd: báo tuần nghỉ)."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        payload = {"chat_id": chat_id, "text": text}
+        response = requests.post(url, data=payload, timeout=30)
+        if response.status_code == 200:
+            log(f"🎉 Đã gửi tin nhắn: {text[:30]}...")
+        else:
+            log(f"❌ Lỗi gửi tin nhắn: {response.text}")
+    except Exception as e:
+        log(f"❌ Lỗi kết nối Telegram: {e}")
+
+
 if __name__ == "__main__":
     bot_token = os.environ.get('TELE_BOT_TOKEN')
     chat_id = os.environ.get('TELE_CHAT_ID')
@@ -307,6 +426,8 @@ if __name__ == "__main__":
         if du_lieu:
             if du_lieu.get("anh_lich_hoc"):
                 send_telegram_photo(du_lieu["anh_lich_hoc"], "📌 Lịch học tuần này", bot_token, chat_id)
+            elif du_lieu.get("tin_nhan_lich_hoc"):
+                send_telegram_message(du_lieu["tin_nhan_lich_hoc"], bot_token, chat_id)
 
             if du_lieu.get("anh_lich_thi"):
                 send_telegram_photo(du_lieu["anh_lich_thi"], "🚨 ĐÃ CÓ LỊCH THI MỚI", bot_token, chat_id)
