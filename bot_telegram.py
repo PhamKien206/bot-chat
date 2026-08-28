@@ -2,7 +2,8 @@ import os
 import re
 import time
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
@@ -29,7 +30,7 @@ RETRY_DELAY_PAGE = 3000       # milliseconds
 RETRY_DELAY_ACTION = 3        # seconds
 RETRY_DELAY_SCRAPE = 10       # seconds
 
-VN_TZ = timezone(timedelta(hours=7))
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 # =========================================================
@@ -476,16 +477,18 @@ def tuan_co_lich_hoc(page):
 
 def cao_lich_hoc(page):
     """
-    Trả về tuple:
-        (duong_dan_anh, tin_nhan)
+    Chỉ xử lý ĐÚNG tuần chứa ngày hôm nay.
 
-    - Có lịch:
-        (path_anh, None)
+    Quy tắc quan trọng:
+    - Tuyệt đối không dùng tuần mặc định nếu tuần mặc định là tuần sau/tuần trước.
+    - Nếu danh sách tuần không có tuần chứa hôm nay, coi tuần hiện tại là chưa có lịch học.
+    - Sau khi chọn tuần, xác minh lại dropdown thật sự đang ở đúng tuần hiện tại trước khi chụp.
 
-    - Không có lịch:
-        (None, "tin nhắn báo nghỉ")
+    Trả về:
+        (path_anh, None)          -> tuần hiện tại có lịch
+        (None, tin_nhan_nghi)     -> tuần hiện tại không có lịch
 
-    Nếu trang thực sự lỗi -> raise để retry_action chạy lại.
+    Lỗi tải trang/dropdown thật sự sẽ raise để retry_action chạy lại.
     """
     log("📅 BƯỚC 2: Vào trang Lịch học...")
 
@@ -514,7 +517,45 @@ def cao_lich_hoc(page):
         timeout=TIMEOUT_CLICK
     )
 
+    # -----------------------------------------------------
+    # Xác định TUẦN HIỆN TẠI theo giờ Việt Nam.
+    # Monday = 0 -> Sunday = 6.
+    # Ví dụ 28/08/2026 -> 24/08/2026 - 30/08/2026.
+    # -----------------------------------------------------
+    today = datetime.now(VN_TZ).date()
+    current_week_start = today - timedelta(days=today.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+
+    log(
+        "🕒 Ngày hiện tại theo giờ Việt Nam: "
+        f"{today.strftime('%d/%m/%Y')}"
+    )
+    log(
+        "📆 Tuần cần kiểm tra: "
+        f"{current_week_start.strftime('%d/%m/%Y')} - "
+        f"{current_week_end.strftime('%d/%m/%Y')}"
+    )
+
+    khoang = (
+        f" ({current_week_start.strftime('%d/%m')} - "
+        f"{current_week_end.strftime('%d/%m')})"
+    )
+
+    def bao_tuan_nghi():
+        log(
+            f"🎉 Tuần này{khoang} không có lịch học."
+        )
+        return (
+            None,
+            (
+                f"🎉 Tuần này{khoang} không có lịch học nào. "
+                "Chúc bạn nghỉ ngơi vui vẻ!"
+            )
+        )
+
+    # -----------------------------------------------------
     # Chờ dropdown tuần.
+    # -----------------------------------------------------
     dropdown_tuan = (
         page.locator("label")
         .filter(has_text="Tuần")
@@ -532,161 +573,218 @@ def cao_lich_hoc(page):
             "Không load được dropdown Tuần."
         )
 
-    today = datetime.now(VN_TZ).date()
-    tuan_dang_xem = None
-
     # -----------------------------------------------------
-    # Nếu web đã mặc định đúng tuần hiện tại thì không cần
-    # mở dropdown -> giảm thao tác + giảm nguy cơ timeout.
+    # BƯỚC A: Kiểm tra tuần web đang hiển thị sẵn.
+    # Chỉ chấp nhận nếu ngày hôm nay thật sự nằm trong range đó.
     # -----------------------------------------------------
     try:
         selected_text = dropdown_tuan.inner_text().strip()
-        selected_range = tach_khoang_tuan(
-            selected_text
-        )
-
-        if selected_range:
-            s, e = selected_range
-
-            if s <= today <= e:
-                tuan_dang_xem = (s, e)
-
-                log(
-                    "✅ Web đang hiển thị đúng tuần hiện tại, "
-                    "không cần chọn lại."
-                )
-
+        selected_range = tach_khoang_tuan(selected_text)
     except Exception:
-        pass
+        selected_text = ""
+        selected_range = None
 
-    # -----------------------------------------------------
-    # Nếu mặc định không đúng tuần -> tìm tuần hiện tại.
-    # -----------------------------------------------------
-    if tuan_dang_xem is None:
-        try:
-            dropdown_tuan.click(
-                timeout=TIMEOUT_CLICK
+    if selected_range:
+        s, e = selected_range
+
+        if s <= today <= e:
+            log(
+                "✅ Web đang hiển thị đúng tuần hiện tại: "
+                f"{s.strftime('%d/%m')} - {e.strftime('%d/%m')}"
             )
 
-            option_selector = (
-                ".ui-select-container.open "
-                ".ui-select-choices-row"
-            )
-
-            if not cho_danh_sach_on_dinh(
+            if not cho_on_dinh(
                 page,
-                option_selector,
-                timeout=TIMEOUT_DROPDOWN
+                ".table-bordered:visible",
+                timeout=TIMEOUT_TABLE_LOAD
             ):
                 raise RuntimeError(
-                    "Danh sách tuần không load."
+                    "Không load được bảng lịch học tuần hiện tại."
                 )
 
-            try:
-                old_content = page.locator(
-                    ".table-bordered:visible"
-                ).first.inner_text()
-            except Exception:
-                old_content = None
+            if not tuan_co_lich_hoc(page):
+                return bao_tuan_nghi()
 
-            rows = page.locator(option_selector)
-            found_week = False
+            path = "anh_lich_hoc.png"
+            page.locator(
+                ".table-bordered:visible"
+            ).first.screenshot(path=path)
 
-            for i in range(rows.count()):
-                row = rows.nth(i)
+            log("✅ Đã chụp đúng lịch học tuần hiện tại!")
+            return path, None
 
-                try:
-                    text = row.inner_text()
-                except Exception:
-                    continue
+        log(
+            "⚠️ Web đang mặc định ở tuần khác: "
+            f"{s.strftime('%d/%m')} - {e.strftime('%d/%m')}. "
+            "Sẽ KHÔNG dùng bảng này."
+        )
 
-                week_range = tach_khoang_tuan(text)
+    # -----------------------------------------------------
+    # BƯỚC B: Web không ở đúng tuần -> mở dropdown và tìm
+    # OPTION có khoảng ngày chứa chính xác ngày hôm nay.
+    # -----------------------------------------------------
+    try:
+        dropdown_tuan.click(timeout=TIMEOUT_CLICK)
 
-                if not week_range:
-                    continue
+        option_selector = (
+            ".ui-select-container.open "
+            ".ui-select-choices-row"
+        )
 
-                start_date, end_date = week_range
-
-                if start_date <= today <= end_date:
-                    row.click(
-                        timeout=TIMEOUT_CLICK
-                    )
-
-                    found_week = True
-                    tuan_dang_xem = (
-                        start_date,
-                        end_date
-                    )
-
-                    if old_content is not None:
-                        changed = cho_noi_dung_doi(
-                            page,
-                            ".table-bordered",
-                            old_content,
-                            timeout=TIMEOUT_CONTENT_CHANGE
-                        )
-
-                        if not changed:
-                            page.wait_for_timeout(700)
-
-                    break
-
-            if not found_week:
-                log(
-                    "⚠️ Không tìm thấy đúng tuần hiện tại. "
-                    "Dùng tuần mặc định đang hiển thị."
-                )
-
-                try:
-                    page.keyboard.press("Escape")
-                except Exception:
-                    pass
-
-        except Exception as e:
-            log(
-                "⚠️ Không chọn được tuần hiện tại, "
-                f"dùng tuần mặc định: {e}"
+        if not cho_danh_sach_on_dinh(
+            page,
+            option_selector,
+            timeout=TIMEOUT_DROPDOWN
+        ):
+            raise RuntimeError(
+                "Danh sách tuần không load."
             )
 
+        rows = page.locator(option_selector)
+        row_tuan_hien_tai = None
+        range_tuan_hien_tai = None
+
+        for i in range(rows.count()):
+            row = rows.nth(i)
+
+            try:
+                text = row.inner_text().strip()
+            except Exception:
+                continue
+
+            week_range = tach_khoang_tuan(text)
+
+            if not week_range:
+                continue
+
+            start_date, end_date = week_range
+
+            if start_date <= today <= end_date:
+                row_tuan_hien_tai = row
+                range_tuan_hien_tai = (
+                    start_date,
+                    end_date
+                )
+                break
+
+        # -------------------------------------------------
+        # Không hề có option chứa hôm nay.
+        # Ví dụ hôm nay 28/08 nhưng option đầu tiên là
+        # 31/08 - 06/09 => tuần 24/08 - 30/08 chưa có lịch.
+        # TUYỆT ĐỐI KHÔNG chụp tuần 31/08.
+        # -------------------------------------------------
+        if row_tuan_hien_tai is None:
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 pass
 
-    # Chờ bảng cuối cùng.
-    if not cho_on_dinh(
-        page,
-        ".table-bordered:visible",
-        timeout=TIMEOUT_TABLE_LOAD
-    ):
-        raise RuntimeError(
-            "Không load được bảng lịch học."
-        )
-
-    # Kiểm tra có lịch hay không.
-    if not tuan_co_lich_hoc(page):
-
-        if tuan_dang_xem:
-            s, e = tuan_dang_xem
-
-            khoang = (
-                f" ({s.strftime('%d/%m')} - "
-                f"{e.strftime('%d/%m')})"
+            log(
+                "✅ Dropdown không có tuần chứa ngày hôm nay. "
+                "Coi tuần hiện tại là không có lịch học."
             )
-        else:
-            khoang = ""
+            return bao_tuan_nghi()
+
+        # Lưu nội dung bảng cũ trước khi đổi tuần.
+        try:
+            old_content = page.locator(
+                ".table-bordered:visible"
+            ).first.inner_text()
+        except Exception:
+            old_content = None
+
+        start_date, end_date = range_tuan_hien_tai
 
         log(
-            f"🎉 Tuần này{khoang} không có lịch học."
+            "👉 Chọn đúng tuần hiện tại: "
+            f"{start_date.strftime('%d/%m/%Y')} - "
+            f"{end_date.strftime('%d/%m/%Y')}"
         )
 
-        return (
-            None,
-            (
-                f"🎉 Tuần này{khoang} không có lịch học nào. "
-                "Chúc bạn nghỉ ngơi vui vẻ!"
-            )
+        row_tuan_hien_tai.click(
+            timeout=TIMEOUT_CLICK
         )
+
+        # Đợi UI có thời gian bắt đầu cập nhật.
+        page.wait_for_timeout(WAIT_AFTER_SELECT)
+
+        # Chờ bảng tồn tại.
+        if not cho_on_dinh(
+            page,
+            ".table-bordered:visible",
+            timeout=TIMEOUT_TABLE_LOAD
+        ):
+            raise RuntimeError(
+                "Không load được bảng sau khi chọn tuần hiện tại."
+            )
+
+        # Chờ bảng đổi nếu trước đó có dữ liệu tuần khác.
+        if old_content is not None:
+            changed = cho_noi_dung_doi(
+                page,
+                ".table-bordered",
+                old_content,
+                timeout=TIMEOUT_CONTENT_CHANGE
+            )
+
+            # Nội dung có thể giống nhau, nên đây không phải điều kiện duy nhất.
+            if not changed:
+                page.wait_for_timeout(700)
+
+        # -------------------------------------------------
+        # BƯỚC C QUAN TRỌNG:
+        # Xác minh dropdown SAU CLICK đang đúng tuần hiện tại.
+        # Nếu vẫn là 31/08 hoặc tuần khác -> không chụp nhầm.
+        # -------------------------------------------------
+        try:
+            selected_after = dropdown_tuan.inner_text().strip()
+            selected_after_range = tach_khoang_tuan(selected_after)
+        except Exception:
+            selected_after = ""
+            selected_after_range = None
+
+        if not selected_after_range:
+            raise RuntimeError(
+                "Không xác minh được tuần sau khi chọn."
+            )
+
+        selected_start, selected_end = selected_after_range
+
+        if not (
+            selected_start <= today <= selected_end
+        ):
+            raise RuntimeError(
+                "Web không chuyển sang đúng tuần hiện tại; "
+                f"đang hiển thị {selected_start.strftime('%d/%m')} - "
+                f"{selected_end.strftime('%d/%m')}. "
+                "Hủy chụp để tránh gửi nhầm tuần."
+            )
+
+        log(
+            "✅ Đã xác minh dropdown đang ở đúng tuần: "
+            f"{selected_start.strftime('%d/%m')} - "
+            f"{selected_end.strftime('%d/%m')}"
+        )
+
+    except RuntimeError:
+        raise
+
+    except Exception as e:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"Lỗi khi chọn tuần hiện tại: {e}"
+        )
+
+    # -----------------------------------------------------
+    # BƯỚC D: Chỉ tới đây khi đã xác minh chắc chắn
+    # bảng đang là tuần chứa hôm nay.
+    # -----------------------------------------------------
+    if not tuan_co_lich_hoc(page):
+        return bao_tuan_nghi()
 
     path = "anh_lich_hoc.png"
 
@@ -696,7 +794,7 @@ def cao_lich_hoc(page):
         path=path
     )
 
-    log("✅ Đã chụp xong lịch học!")
+    log("✅ Đã chụp đúng lịch học tuần hiện tại!")
 
     return path, None
 
