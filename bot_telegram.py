@@ -548,8 +548,8 @@ def cao_lich_hoc(page):
         return (
             None,
             (
-                f"🎉 Tuần này{khoang} không có lịch học nào. "
-                "Chúc bạn nghỉ ngơi vui vẻ!"
+                f"Tuần này{khoang} không có lịch học nào. "
+                "Nghỉ"
             )
         )
 
