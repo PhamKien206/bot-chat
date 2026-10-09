@@ -4,17 +4,14 @@ on:
   schedule:
     # Mỗi ngày 22:47 UTC = 05:47 sáng giờ VN (hôm sau).
     # Tránh mốc tròn giờ vì GitHub hay trễ 10–30 phút lúc đó -> tin tới khoảng 6h.
-    # Bot tự biết hôm nay là thứ mấy:
-    #   Thứ Hai      -> quét đầy đủ (lịch học + lịch thi + học phí), lưu lịch cả tuần
-    #   Ngày còn lại -> chỉ đọc lịch đã lưu, báo hôm nay học gì / nghỉ (không mở trình duyệt)
     - cron: '47 22 * * *'
   workflow_dispatch:
     inputs:
       che_do:
-        description: 'Chế độ chạy'
+        description: 'auto = tự chọn theo thứ; tuan = gửi bản thứ Hai; ngay = bản ngày thường'
         type: choice
         default: auto
-        options: [auto, tuan, ngay, hoc]
+        options: [auto, tuan, ngay]
 
 # Không cho 2 lần chạy chồng nhau (vd: bấm tay đúng lúc cron chạy).
 concurrency:
@@ -27,7 +24,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -37,8 +34,11 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      # Lịch tuần đã lưu + lịch thi đã báo. Bot chạy mỗi ngày nên cache luôn được dùng,
-      # không bị GitHub xóa (chỉ xóa cache bỏ không quá 7 ngày).
+      - name: Cài thư viện
+        run: pip install -r requirements.txt
+
+      # Bản lưu lịch (dùng khi web trường lỗi), lịch thi đã báo, học phí lần trước.
+      # Bot chạy mỗi ngày nên cache luôn được dùng, không bị GitHub xóa.
       - name: Khôi phục trạng thái
         uses: actions/cache/restore@v4
         with:
@@ -46,26 +46,13 @@ jobs:
           key: bot-state-${{ github.run_id }}
           restore-keys: bot-state-
 
-      - name: Xác định chế độ
-        id: mode
-        run: |
-          pip install "requests>=2.32,<3"
-          python bot_telegram.py "${{ inputs.che_do || 'auto' }}" --che-do
-
-      # Chỉ cài trình duyệt khi cần quét web (thứ Hai hoặc chưa có lịch tuần).
-      - name: Cài Playwright + Chromium
-        if: steps.mode.outputs.che_do != 'ngay'
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps --only-shell chromium
-
       - name: Run Bot
         env:
           TELE_BOT_TOKEN: ${{ secrets.TELE_BOT_TOKEN }}
           TELE_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
           MSV: ${{ secrets.MSV }}
           PASS_TRUONG: ${{ secrets.PASS_TRUONG }}
-        run: python bot_telegram.py "${{ steps.mode.outputs.che_do }}"
+        run: python bot_telegram.py "${{ inputs.che_do || 'auto' }}"
 
       - name: Lưu trạng thái
         if: always()
