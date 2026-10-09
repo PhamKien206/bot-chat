@@ -1,15 +1,20 @@
 """
-Bot Telegram báo Lịch học / Lịch thi / Học phí từ cổng sinh viên TLU.
+Bot Telegram báo Lịch học / Lịch thi / Học phí từ cổng sinh viên Thủy Lợi (sinhvien1.tlu.edu.vn).
+
+Gọi thẳng API của web trường (đúng các request mà trang web tự gọi), không cần trình duyệt:
+mỗi lần chạy chỉ vài giây.
 
 Chạy bởi GitHub Actions mỗi sáng (xem .github/workflows/run_bot.yml):
-    python bot_telegram.py tuan   Thứ Hai: quét lịch học + lịch thi + học phí, lưu lịch cả tuần,
-                                  rồi báo lịch hôm nay.
-    python bot_telegram.py ngay   Các ngày khác: đọc lịch đã lưu, báo hôm nay học gì / nghỉ.
-                                  Không mở trình duyệt.
-    python bot_telegram.py hoc    Dự phòng khi chưa có lịch tuần đã lưu: chỉ quét lịch học.
-    python bot_telegram.py auto   Tự chọn 1 trong 3 chế độ trên (mặc định).
-    python bot_telegram.py --che-do   Chỉ in chế độ sẽ chạy (workflow dùng để quyết định
-                                      có cần cài trình duyệt hay không).
+    python bot_telegram.py         Tự chọn: thứ Hai gửi thêm tổng quan cả tuần.
+    python bot_telegram.py tuan    Ép gửi bản thứ Hai (tổng quan tuần + nhắc học phí).
+    python bot_telegram.py ngay    Ép gửi bản ngày thường.
+
+Mỗi sáng bot gửi:
+    - Lịch học hôm nay (hoặc báo nghỉ), kèm môn thi hôm nay nếu có.
+    - 🚨 Lịch thi MỚI / THAY ĐỔI ngay khi trường đăng.
+    - ⏰ Nhắc trước 1 ngày khi ngày mai có thi.
+    - 💰 Học phí: báo khi số tiền còn phải đóng thay đổi; thứ Hai nhắc lại nếu còn nợ.
+    - Thứ Hai: thêm tổng quan lịch học cả tuần + các môn thi sắp tới.
 
 Biến môi trường cần có:
     TELE_BOT_TOKEN, TELE_CHAT_ID, MSV, PASS_TRUONG
@@ -18,23 +23,17 @@ Tùy chọn:
     TLU_BASE_URL    đổi địa chỉ web (dùng khi test)
 """
 
-import hashlib
 import json
 import os
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-
-try:
-    from playwright.sync_api import TimeoutError as PWTimeout
-    from playwright.sync_api import sync_playwright
-except ImportError:   # chế độ "ngay" không cần cài Playwright
-    PWTimeout = sync_playwright = None
 
 
 # =========================================================
@@ -42,179 +41,48 @@ except ImportError:   # chế độ "ngay" không cần cài Playwright
 # =========================================================
 
 BASE_URL = os.environ.get("TLU_BASE_URL", "https://sinhvien1.tlu.edu.vn").rstrip("/")
-URL_LOGIN = f"{BASE_URL}/#/login"
-URL_LICH_HOC = f"{BASE_URL}/#/student/profile"
-URL_LICH_THI = f"{BASE_URL}/#/search_exam_room_student/listing"
-URL_HOC_PHI = f"{BASE_URL}/#/student_voucher_receive_pay/listing"
+API = f"{BASE_URL}/education"
+
+# Lấy từ tab Network (F12) của trang web trường.
+API_DANG_NHAP = f"{API}/oauth/token"
+API_HOC_KY = f"{API}/api/semester/semester_info"
+API_LICH_HOC = f"{API}/api/StudentCourseSubject/studentLoginUser/{{hk}}"
+API_DS_HOC_KY = f"{API}/api/semester/1/100"
+API_DOT = f"{API}/api/registerperiod/find/{{hk}}"
+API_LICH_THI = f"{API}/api/semestersubjectexamroom/getListRoomByStudentByLoginUser/{{hk}}/{{dot}}/{{lan}}"
+API_HOC_PHI = f"{API}/api/student/viewstudentpayablebyLoginUser"
+
+# client_id / client_secret là mã CHUNG của web trường (ai đăng nhập cũng gửi y hệt),
+# không phải thông tin bí mật của bạn.
+OAUTH_CLIENT = {"client_id": "education_client", "client_secret": "password"}
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-
-# Timeout (ms)
-TIMEOUT_NAV = 60_000
-TIMEOUT_ELEMENT = 30_000
-TIMEOUT_CLICK = 12_000
-TIMEOUT_DOI_NOI_DUNG = 25_000   # chờ bảng đổi sau khi chọn dropdown (web chậm)
-TIMEOUT_HOC_PHI = 15_000        # chờ ô tiền nợ (không có = không nợ)
-
-# Retry
-MAX_RETRY_SCRAPE = 2            # thử lại cả phiên (mở browser + đăng nhập)
-MAX_RETRY_MUC = 2               # thử lại từng mục (lịch học / thi / học phí)
+TIMEOUT_API = 20            # giây
+MAX_RETRY_API = 3
 MAX_RETRY_TELEGRAM = 3
-
-# Lịch thi: chỉ xét năm học mới nhất và năm liền trước.
-# Năm học cũ hơn không thể có lịch thi tương lai.
-SO_NAM_HOC_THI = 2
-LOAI_HOC_KY = ("Học kỳ chính", "Học kỳ hè")
-
-# Ảnh rõ hơn khi xem trên điện thoại.
-DEVICE_SCALE = 1.5
+LAN_THI = (1, 2, 3)         # lần 1 (thi chính), lần 2-3 (thi lại)
+# Học kỳ còn liên quan tới lịch thi: đã bắt đầu (hoặc bắt đầu trong 30 ngày tới)
+# và kết thúc chưa quá 60 ngày (trường hay xếp thi sau khi học kỳ kết thúc).
+THI_TRUOC_HK_NGAY = 30
+THI_SAU_HK_NGAY = 60
+SO_LUONG_SONG_SONG = 6
 
 STATE_DIR = Path(os.environ.get("BOT_STATE_DIR", ".bot_state"))
 STATE_FILE = STATE_DIR / "state.json"
 
-# Selector dùng chung
-SEL_DROPDOWN = ".page-content .ui-select-match"
-SEL_OPTION = ".ui-select-container.open .ui-select-choices-row"
-CSS_BANG_LICH_HOC = ".table-bordered"
-CSS_BANG_THI = ".page-content table"
+TEN_THU = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
 
 
 class LoiDangNhap(Exception):
-    """Sai tài khoản/mật khẩu: không retry để tránh bị khóa tài khoản."""
+    """Sai tài khoản/mật khẩu: không thử lại để tránh bị khóa tài khoản."""
 
 
 # =========================================================
-# TIỆN ÍCH CHUNG
+# TIỆN ÍCH
 # =========================================================
 
 def log(msg=""):
     print(msg, flush=True)
-
-
-def tach_khoang_ngay(text):
-    """'Tuần 5 (24/08/2026 - 30/08/2026)' -> (date(2026,8,24), date(2026,8,30)) hoặc None."""
-    m = re.search(
-        r"\((\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\)",
-        text or "",
-    )
-    if not m:
-        return None
-    try:
-        return tuple(datetime.strptime(s, "%d/%m/%Y").date() for s in m.groups())
-    except ValueError:
-        return None
-
-
-def chua_ngay(text, ngay):
-    khoang = tach_khoang_ngay(text)
-    return bool(khoang) and khoang[0] <= ngay <= khoang[1]
-
-
-def cac_ngay_trong(text):
-    """Mọi ngày dd/mm/yyyy hợp lệ có trong chuỗi."""
-    ket_qua = []
-    for s in re.findall(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text or ""):
-        try:
-            ket_qua.append(datetime.strptime(s, "%d/%m/%Y").date())
-        except ValueError:
-            pass
-    return ket_qua
-
-
-# "T2", "Thứ 2", "Thứ hai", "CN", "Chủ nhật" -> 0..6 (thứ Hai = 0)
-_THU_CHU = {"hai": 0, "ba": 1, "tư": 2, "tu": 2, "năm": 3, "nam": 3, "sáu": 4, "sau": 4, "bảy": 5, "bay": 5}
-
-
-def thu_cua_cot(tieu_de):
-    t = (tieu_de or "").strip().lower()
-    if re.match(r"^(cn|chủ\s*nhật|chu\s*nhat)\b", t):
-        return 6
-    m = re.match(r"^(?:t|thứ|thu)\s*\.?\s*([2-7])\b", t)
-    if m:
-        return int(m.group(1)) - 2
-    m = re.match(r"^(?:thứ|thu)\s+(\w+)", t)
-    if m and m.group(1) in _THU_CHU:
-        return _THU_CHU[m.group(1)]
-    return None
-
-
-def lam_gon(text):
-    """Gộp khoảng trắng, bỏ dòng trống."""
-    dong = [re.sub(r"\s+", " ", d).strip() for d in (text or "").splitlines()]
-    return "\n".join(d for d in dong if d)
-
-
-def phan_tich_lich_tuan(bang, dau_tuan):
-    """
-    Bảng (tieu_de + luoi) -> {"YYYY-MM-DD": [{"ca": ..., "mon": ...}, ...]} cho 7 ngày trong tuần.
-
-    - Cột ngày nhận ra theo tiêu đề (T2..CN / Thứ 2.. / Chủ nhật). Không nhận ra được thì
-      coi 7 cột cuối là thứ Hai..Chủ nhật.
-    - Các cột còn lại (Ca / Buổi / Tiết...) ghép thành nhãn của hàng.
-    - Một môn kéo dài nhiều hàng liền nhau (lặp nội dung) được gộp làm một.
-    """
-    tieu_de = bang.get("tieu_de") or []
-    luoi = bang.get("luoi") or []
-    so_cot = max((len(h) for h in luoi), default=0)
-
-    cot_thu = {i: thu_cua_cot(t) for i, t in enumerate(tieu_de)}
-    cot_thu = {i: d for i, d in cot_thu.items() if d is not None}
-    if len(cot_thu) < 5 and so_cot >= 7:
-        cot_thu = {so_cot - 7 + k: k for k in range(7)}
-    cot_nhan = [i for i in range(so_cot) if i not in cot_thu]
-
-    lich = {(dau_tuan + timedelta(days=k)).isoformat(): [] for k in range(7)}
-    nhan_cu = {}
-    cuoi = {}   # thứ -> (chỉ số hàng, mục) của môn gần nhất, để gộp hàng liền nhau
-    for r, hang in enumerate(luoi):
-        phan = []
-        for c in cot_nhan:
-            o = hang[c] if c < len(hang) else ""
-            if o is None:            # ô nhãn bị kéo dài từ hàng trên
-                o = nhan_cu.get(c, "")
-            nhan_cu[c] = o
-            if o:
-                phan.append(lam_gon(o).replace("\n", " "))
-        nhan = " · ".join(phan)
-        nhan_cuoi = phan[-1] if phan else ""   # vd "Tiết 3" (bỏ "Sáng ·" lặp lại)
-
-        for c, thu in cot_thu.items():
-            o = hang[c] if c < len(hang) else ""
-            truoc = cuoi.get(thu)
-            noi_tiep = truoc and truoc[0] == r - 1
-            # Môn kéo dài xuống hàng này: ô gộp (None) hoặc lặp đúng nội dung hàng trên.
-            if noi_tiep and (o is None or (o and lam_gon(o) == truoc[1]["mon"])):
-                dau = truoc[1]["ca"].split(" → ")[0]
-                if nhan_cuoi and nhan_cuoi != dau:
-                    truoc[1]["ca"] = f"{dau} → {nhan_cuoi}"
-                cuoi[thu] = (r, truoc[1])
-                continue
-            if not o:
-                continue
-            mon = lam_gon(o)
-            ngay = (dau_tuan + timedelta(days=thu)).isoformat()
-            muc = {"ca": nhan, "mon": mon}
-            lich[ngay].append(muc)
-            cuoi[thu] = (r, muc)
-    return lich
-
-
-TEN_THU = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
-
-
-def tin_lich_hom_nay(lich_tuan, ngay):
-    """Tin nhắn báo lịch học của ngày `ngay` từ lịch tuần đã lưu."""
-    tieu_de = f"{TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}"
-    if lich_tuan.get("ngay") is None:
-        return None   # không đọc được chi tiết -> nơi gọi gửi ảnh lịch tuần
-    cac_mon = lich_tuan["ngay"].get(ngay.isoformat(), [])
-    if not cac_mon:
-        return f"😴 {tieu_de}\nHôm nay không có lịch học. Nghỉ!"
-    phan = [f"☀️ {tieu_de}", f"📚 Hôm nay có {len(cac_mon)} buổi học:"]
-    for m in cac_mon:
-        dau = f"🕘 {m['ca']}\n" if m.get("ca") else ""
-        phan.append(f"{dau}{m['mon']}")
-    return "\n\n".join(phan)
 
 
 def hom_nay():
@@ -222,9 +90,17 @@ def hom_nay():
 
 
 def ngan_gon(loi):
-    """Dòng đầu của thông báo lỗi (bỏ phần 'Call log' dài dòng của Playwright)."""
     dong = str(loi).strip().splitlines()
     return dong[0] if dong else type(loi).__name__
+
+
+def ms_sang_ngay(ms):
+    return datetime.fromtimestamp(ms / 1000, VN_TZ).date()
+
+
+def tien(so):
+    """9180000.0 -> '9.180.000'"""
+    return f"{int(round(so or 0)):,}".replace(",", ".")
 
 
 def link_lan_chay():
@@ -238,543 +114,383 @@ def link_lan_chay():
 
 
 # =========================================================
-# TIỆN ÍCH PLAYWRIGHT
+# API WEB TRƯỜNG
 # =========================================================
 
-# Tìm phần tử ĐANG HIỂN THỊ đầu tiên khớp CSS (querySelector không hiểu :visible).
-_JS_TIM = "sel => [...document.querySelectorAll(sel)].find(e => e.getClientRects().length > 0)"
+class TluApi:
+    def __init__(self, msv, password):
+        self.msv = msv
+        self.password = password
+        self.s = requests.Session()
+        self.s.headers["Accept"] = "application/json"
 
-# Đọc innerText của bảng đang hiển thị. Trả null khi chưa có bảng hoặc tbody đang
-# trống: Angular thường XÓA bảng rồi mới đổ dữ liệu mới, lúc trống không được tính
-# là "đã cập nhật".
-JS_DOC_TEXT = f"""sel => {{
-    const el = ({_JS_TIM})(sel);
-    if (!el) return null;
-    const tb = el.querySelector('tbody');
-    if (tb && !tb.querySelector('tr')) return null;
-    return el.innerText;
-}}"""
-
-JS_BANG_CO_MON = f"""sel => {{
-    const t = ({_JS_TIM})(sel);
-    if (!t) return null;
-    return [...t.querySelectorAll('tbody tr')].some(tr =>
-        [...tr.querySelectorAll('td')].slice(1).some(td => td.innerText.trim() !== '')
-    );
-}}"""
-
-
-# Đọc bảng lịch học thành lưới ô (đã xử lý rowspan/colspan).
-# Ô bị ô phía trên/bên trái kéo dài vào được đánh dấu null để không lặp môn.
-JS_DOC_BANG = f"""sel => {{
-    const t = ({_JS_TIM})(sel);
-    if (!t) return null;
-    const hang_tieu_de = t.querySelector('thead tr:last-child');
-    const tieu_de = hang_tieu_de
-        ? [...hang_tieu_de.children].flatMap(c => Array(c.colSpan || 1).fill(c.innerText.trim()))
-        : [];
-    const luoi = [];
-    [...t.querySelectorAll('tbody tr')].forEach((tr, r) => {{
-        luoi[r] = luoi[r] || [];
-        let c = 0;
-        for (const td of tr.children) {{
-            while (luoi[r][c] !== undefined) c++;
-            const rs = td.rowSpan || 1, cs = td.colSpan || 1, text = td.innerText.trim();
-            for (let i = 0; i < rs; i++) for (let j = 0; j < cs; j++) {{
-                luoi[r + i] = luoi[r + i] || [];
-                luoi[r + i][c + j] = (i === 0 && j === 0) ? text : null;
-            }}
-            c += cs;
-        }}
-    }});
-    return {{tieu_de, luoi: luoi.map(h => Array.from(h, x => x === undefined ? '' : x))}};
-}}"""
-
-
-def doc_text(page, css):
-    try:
-        return page.evaluate(JS_DOC_TEXT, css)
-    except Exception:
-        return None
-
-
-def cho_text_on_dinh(page, css, timeout=5_000, khoang=200):
-    """Chờ innerText của phần tử giống nhau ở 2 lần đo liên tiếp (bảng render xong)."""
-    het_gio = time.monotonic() + timeout / 1000
-    truoc = doc_text(page, css)
-    while time.monotonic() < het_gio:
-        page.wait_for_timeout(khoang)
-        sau = doc_text(page, css)
-        if sau is not None and sau == truoc:
-            return True
-        truoc = sau
-    return False
-
-
-class TheoDoiMang:
-    """Đếm request API (xhr/fetch) để biết Angular đã tải xong dữ liệu chưa."""
-
-    def __init__(self, page):
-        self.tong = 0
-        self.dang_cho = 0
-        page.on("request", self._bat_dau)
-        page.on("requestfinished", self._xong)
-        page.on("requestfailed", self._xong)
-
-    @staticmethod
-    def _la_api(req):
-        return req.resource_type in ("xhr", "fetch")
-
-    def _bat_dau(self, req):
-        if self._la_api(req):
-            self.tong += 1
-            self.dang_cho += 1
-
-    def _xong(self, req):
-        if self._la_api(req):
-            self.dang_cho = max(0, self.dang_cho - 1)
-
-
-_mang = None   # TheoDoiMang của page hiện tại
-
-
-def cho_bang_cap_nhat(page, css, noi_dung_cu, so_request_truoc):
-    """
-    Sau khi đổi dropdown, dừng chờ ngay khi:
-      - bảng đã có nội dung mới, hoặc
-      - request API đã xong (dữ liệu mới có thể giống hệt dữ liệu cũ), hoặc
-      - 1.5s mà không có request nào (lựa chọn không cần tải dữ liệu).
-    Không phải ngồi chờ hết timeout khi bảng không đổi như trước.
-    Sau đó chờ bảng render ổn định.
-    """
-    bat_dau = time.monotonic()
-    het_gio = bat_dau + TIMEOUT_DOI_NOI_DUNG / 1000
-    while time.monotonic() < het_gio:
-        text = doc_text(page, css)
-        if text is not None:
-            if text != noi_dung_cu:
-                break
-            if _mang is not None:
-                co_request = _mang.tong > so_request_truoc
-                if co_request and _mang.dang_cho == 0:
-                    break
-                if not co_request and time.monotonic() - bat_dau > 1.5:
-                    break
-        page.wait_for_timeout(100)
-    else:
-        # Hết giờ: nếu web vẫn đang tải dữ liệu thì bảng trên màn hình là bảng CŨ.
-        # Báo lỗi để thử lại, tuyệt đối không đọc/chụp bảng chưa cập nhật.
-        if _mang is not None and _mang.dang_cho > 0:
-            raise RuntimeError("Web trường phản hồi quá chậm, bảng chưa cập nhật.")
-    cho_text_on_dinh(page, css)
-
-
-def so_request():
-    return _mang.tong if _mang is not None else 0
-
-
-def cho_danh_sach_on_dinh(page, selector, timeout):
-    """Chờ số phần tử > 0 và không đổi qua 2 lần đo (ng-repeat render dần)."""
-    het_gio = time.monotonic() + timeout / 1000
-    truoc, lan_on_dinh = -1, 0
-    while time.monotonic() < het_gio:
-        so = page.locator(selector).count()
-        if so > 0 and so == truoc:
-            lan_on_dinh += 1
-            if lan_on_dinh >= 2:
-                return True
-        else:
-            lan_on_dinh = 0
-        truoc = so
-        page.wait_for_timeout(150)
-    return truoc > 0
-
-
-# Angular đổi trang bằng #hash: giao diện trang cũ còn nằm lại một lúc. Đánh dấu
-# các phần tử cũ trước khi chuyển, rồi chờ chúng biến mất để không đọc nhầm bảng/
-# dropdown của trang trước.
-JS_DANH_DAU_CU = """() => document
-    .querySelectorAll('.page-content table, .page-content .ui-select-match, .portlet-body')
-    .forEach(e => e.setAttribute('data-bot-cu', ''))"""
-JS_HET_TRANG_CU = "() => !document.querySelector('[data-bot-cu]')"
-
-
-def mo_trang(page, url, lan_thu=3):
-    for i in range(1, lan_thu + 1):
-        try:
+    def _goi(self, method, url, **kw):
+        """Gọi API, tự thử lại khi lỗi mạng hoặc máy chủ trường lỗi (5xx)."""
+        loi = None
+        for i in range(1, MAX_RETRY_API + 1):
             try:
-                page.evaluate(JS_DANH_DAU_CU)
-            except Exception:
-                pass
-            page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_NAV)
-            try:
-                page.wait_for_function(JS_HET_TRANG_CU, timeout=10_000)
-            except PWTimeout:
-                pass   # web giữ nguyên khung cũ: vẫn tiếp tục như bình thường
-            return
-        except Exception as e:
-            log(f"⚠️ Mở trang lỗi ({i}/{lan_thu}): {e}")
-            if i < lan_thu:
-                page.wait_for_timeout(3_000)
-    raise RuntimeError(f"Không mở được {url}")
+                r = self.s.request(method, url, timeout=TIMEOUT_API, **kw)
+                if r.status_code < 500:
+                    return r
+                loi = f"HTTP {r.status_code}"
+            except requests.RequestException as e:
+                loi = e
+            log(f"⚠️ API lỗi ({i}/{MAX_RETRY_API}): {ngan_gon(loi)}")
+            if i < MAX_RETRY_API:
+                time.sleep(3 * i)
+        raise RuntimeError(f"Không gọi được API web trường: {ngan_gon(loi)}")
 
+    def dang_nhap(self):
+        r = self._goi("POST", API_DANG_NHAP, data={
+            **OAUTH_CLIENT,
+            "grant_type": "password",
+            "username": self.msv,
+            "password": self.password,
+        })
+        if r.status_code in (400, 401):     # OAuth trả invalid_grant khi sai mật khẩu
+            raise LoiDangNhap("Sai MSV hoặc mật khẩu.")
+        r.raise_for_status()
+        token = r.json().get("access_token")
+        if not token:
+            raise RuntimeError("API đăng nhập không trả về token.")
+        self.s.headers["Authorization"] = f"Bearer {token}"
 
-def dong_dropdown(page):
-    try:
-        page.keyboard.press("Escape")
-    except Exception:
-        pass
-
-
-def mo_dropdown(page, dropdown):
-    """Click mở dropdown, trả về locator các option."""
-    dropdown.click(timeout=TIMEOUT_CLICK)
-    if not cho_danh_sach_on_dinh(page, SEL_OPTION, TIMEOUT_ELEMENT):
-        dong_dropdown(page)
-        raise RuntimeError("Dropdown không load được danh sách lựa chọn.")
-    return page.locator(SEL_OPTION)
-
-
-def chon_dropdown(page, index, css_bang, text=None, vi_tri=None):
-    """
-    Chọn một option ở dropdown thứ `index` (theo text hoặc vị trí) rồi chờ bảng cập nhật.
-    Nếu option đó đang được chọn sẵn thì bỏ qua, không phải chờ bảng đổi.
-    Trả về True nếu bảng đang hiển thị đúng lựa chọn.
-    """
-    dropdowns = page.locator(SEL_DROPDOWN)
-    if dropdowns.count() <= index:
-        return False
-
-    dropdown = dropdowns.nth(index)
-    try:
-        dang_chon = dropdown.inner_text().strip()
-        cu = doc_text(page, css_bang)
-        options = mo_dropdown(page, dropdown)
-        opt = options.filter(has_text=text).first if text is not None else options.nth(vi_tri)
-
-        if opt.count() == 0:
-            dong_dropdown(page)
-            return False
-
-        if opt.inner_text().strip() == dang_chon:
-            dong_dropdown(page)
-            return True
-
-        truoc = so_request()
-        opt.click(timeout=TIMEOUT_CLICK)
-    except Exception as e:
-        log(f"⚠️ Lỗi chọn dropdown #{index}: {e}")
-        dong_dropdown(page)
-        return False
-
-    cho_bang_cap_nhat(page, css_bang, cu, truoc)
-    return True
-
-
-def chup(locator, path):
-    locator.screenshot(path=path, animations="disabled")
-    return path
-
-
-def chup_debug(page, ten):
-    path = f"debug_{ten}.png"
-    try:
-        page.screenshot(path=path, full_page=True)
-        return path
-    except Exception:
-        return None
-
-
-# =========================================================
-# ĐĂNG NHẬP
-# =========================================================
-
-# Câu báo lỗi thường gặp ở form đăng nhập. Chỉ tính câu XUẤT HIỆN SAU khi bấm
-# Đăng nhập, để chữ có sẵn trên trang không gây báo nhầm.
-JS_KET_QUA_DANG_NHAP = r"""before => {
-    if (!location.hash.includes('/login')) return 'ok';
-    const t = document.body.innerText.toLowerCase();
-    const m = t.match(/không đúng|không chính xác|sai mật khẩu|sai tài khoản|incorrect|invalid/);
-    return (m && !before.includes(m[0])) ? 'sai' : false;
-}"""
-
-
-def dang_nhap(page, msv, password):
-    log("🚀 Đăng nhập...")
-    mo_trang(page, URL_LOGIN)
-    page.wait_for_selector("#username", timeout=TIMEOUT_ELEMENT)
-    page.fill("#username", msv)
-    page.fill("#password", password)
-
-    truoc = page.evaluate("() => document.body.innerText.toLowerCase()")
-    page.click('button:has-text("Đăng nhập")', timeout=TIMEOUT_CLICK)
-
-    try:
-        ket_qua = page.wait_for_function(
-            JS_KET_QUA_DANG_NHAP, arg=truoc, timeout=TIMEOUT_NAV
-        ).json_value()
-    except PWTimeout:
-        raise RuntimeError("Đăng nhập quá thời gian chờ (web trường chậm?).")
-
-    if ket_qua == "sai":
-        raise LoiDangNhap("Sai MSV hoặc mật khẩu.")
-    log("✅ Đăng nhập thành công")
+    def get(self, url):
+        r = self._goi("GET", url)
+        r.raise_for_status()
+        return r.json()
 
 
 # =========================================================
 # LỊCH HỌC
 # =========================================================
 
-def cao_lich_hoc(page):
+def nhom_thuc_hanh(ten_lop):
+    """'Lập trình mạng-5-26 (66ANM2 (THM 1))' -> 'THM 1'."""
+    m = re.search(r"\b(TH[A-ZĐ]*\s*\d+)\b", ten_lop or "")
+    return m.group(1) if m else ""
+
+
+def tach_buoi_hoc(cac_mon):
     """
-    Chỉ xử lý ĐÚNG tuần chứa hôm nay (giờ VN).
-    Trả về:
-        {"tuan": "YYYY-MM-DD" (thứ Hai), "ngay": {ngày: [môn...]}, "anh": path}  có lịch
-        {"tuan": ..., "ngay": {}, "tin": "..."}                                   cả tuần nghỉ
+    JSON môn học -> danh sách khung giờ học, mỗi phần tử:
+        thu (0 = thứ Hai .. 6 = Chủ nhật), tu/den (ngày ISO), bat_dau/ket_thuc ("12:55"),
+        tiet ("7-9"), mon, phong, gv, nhom ("THM 1" nếu là buổi thực hành)
+    weekIndex của trường: 2 = Thứ Hai ... 7 = Thứ Bảy, 8 = Chủ nhật.
     """
-    log("📅 Lịch học...")
-    mo_trang(page, URL_LICH_HOC)
+    buoi = []
+    for mon in cac_mon or []:
+        lop = mon.get("courseSubject") or {}
+        ten = mon.get("subjectName") or "?"
+        gv_lop = (lop.get("teacher") or {}).get("displayName")
+        nhom = nhom_thuc_hanh(lop.get("displayName") or mon.get("subjectCode"))
+        for tkb in lop.get("timetables") or []:
+            try:
+                thu = int(tkb["weekIndex"]) - 2
+                tu, den = ms_sang_ngay(tkb["startDate"]), ms_sang_ngay(tkb["endDate"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not 0 <= thu <= 6:
+                continue
+            dau = tkb.get("startHour") or {}
+            cuoi = tkb.get("endHour") or {}
+            phong = (tkb.get("roomName") or (tkb.get("room") or {}).get("name") or "").strip(" `'")
+            gv = (tkb.get("teacher") or {}).get("displayName") or tkb.get("teacherName") or gv_lop
+            tiet = "-".join(str(x) for x in (dau.get("indexNumber"), cuoi.get("indexNumber")) if x)
+            buoi.append({
+                "thu": thu, "tu": tu.isoformat(), "den": den.isoformat(),
+                "bat_dau": dau.get("startString") or "", "ket_thuc": cuoi.get("endString") or "",
+                "tiet": tiet, "mon": ten, "phong": phong, "gv": gv or "", "nhom": nhom,
+            })
+    return buoi
 
-    tab_bang = page.locator('a:has-text("Bảng")').first
-    tab_bang.wait_for(state="visible", timeout=TIMEOUT_ELEMENT)
-    tab_bang.click(timeout=TIMEOUT_CLICK)
 
-    ngay = hom_nay()
-    dau_tuan = ngay - timedelta(days=ngay.weekday())
-    cuoi_tuan = dau_tuan + timedelta(days=6)
-    khoang = f"({dau_tuan:%d/%m} - {cuoi_tuan:%d/%m})"
-    nghi = {
-        "tuan": dau_tuan.isoformat(),
-        "ngay": {},
-        "tin": f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!",
-    }
+def buoi_trong_ngay(buoi, ngay):
+    iso = ngay.isoformat()
+    ket_qua, da_co = [], set()
+    for b in sorted(buoi, key=lambda b: (b["bat_dau"], b["mon"])):
+        if b["thu"] == ngay.weekday() and b["tu"] <= iso <= b["den"]:
+            khoa = (b["bat_dau"], b["mon"], b["phong"])
+            if khoa not in da_co:
+                da_co.add(khoa)
+                ket_qua.append(b)
+    return ket_qua
 
-    dropdown_tuan = (
-        page.locator("label").filter(has_text="Tuần")
-        .locator("..").locator(".ui-select-match")
-    )
-    dropdown_tuan.wait_for(state="visible", timeout=TIMEOUT_ELEMENT)
 
-    if chua_ngay(dropdown_tuan.inner_text(), ngay):
-        # Web đang mở sẵn đúng tuần này.
-        page.locator(f"{CSS_BANG_LICH_HOC}:visible").first.wait_for(timeout=TIMEOUT_ELEMENT)
-        cho_text_on_dinh(page, CSS_BANG_LICH_HOC)
-    else:
-        cu = doc_text(page, CSS_BANG_LICH_HOC)
-        options = mo_dropdown(page, dropdown_tuan)
-        # Lấy text mọi option trong 1 lần gọi thay vì đọc từng dòng.
-        vi_tri = next(
-            (i for i, t in enumerate(options.all_inner_texts()) if chua_ngay(t, ngay)),
-            None,
-        )
-        if vi_tri is None:
-            # Danh sách tuần không có tuần này -> chưa có lịch. KHÔNG chụp tuần khác.
-            dong_dropdown(page)
-            log("ℹ️ Không có tuần chứa hôm nay trong danh sách.")
-            return nghi
-
-        truoc = so_request()
-        options.nth(vi_tri).click(timeout=TIMEOUT_CLICK)
-        cho_bang_cap_nhat(page, CSS_BANG_LICH_HOC, cu, truoc)
-
-        # Xác minh lại trước khi chụp để không bao giờ gửi nhầm tuần.
-        sau = dropdown_tuan.inner_text()
-        if not chua_ngay(sau, ngay):
-            raise RuntimeError(f"Web không chuyển sang tuần hiện tại (đang: {sau.strip()}).")
-
-    co_mon = page.evaluate(JS_BANG_CO_MON, CSS_BANG_LICH_HOC)
-    if co_mon is None:
-        raise RuntimeError("Không thấy bảng lịch học.")
-    if not co_mon:
-        return nghi
-
-    bang = page.evaluate(JS_DOC_BANG, CSS_BANG_LICH_HOC)
-    lich = phan_tich_lich_tuan(bang or {}, dau_tuan)
-    so_buoi = sum(len(v) for v in lich.values())
-    if so_buoi == 0:
-        # Bảng có môn nhưng không tách được theo ngày: KHÔNG lưu là "nghỉ".
-        # Các ngày sau bot sẽ gửi lại ảnh lịch tuần thay vì tin chữ.
-        log("⚠️ Không tách được lịch theo ngày, sẽ dùng ảnh lịch tuần.")
-        lich = None
-
-    path = chup(page.locator(f"{CSS_BANG_LICH_HOC}:visible").first, "anh_lich_hoc.png")
-    log(f"✅ Đã chụp và đọc lịch học tuần này ({so_buoi} buổi)")
-    return {"tuan": dau_tuan.isoformat(), "ngay": lich, "anh": path}
+def _ten_mon(b):
+    return f"{b['mon']} (thực hành {b['nhom']})" if b.get("nhom") else b["mon"]
 
 
 # =========================================================
 # LỊCH THI
 # =========================================================
 
-def dong_thi_sap_toi(page, ngay):
-    """Các dòng trong bảng thi có ngày >= hôm nay."""
-    try:
-        rows = page.locator(f"{CSS_BANG_THI} tbody tr").all_inner_texts()
-    except Exception:
-        return []
-    return [r.strip() for r in rows if any(d >= ngay for d in cac_ngay_trong(r))]
-
-
-def cao_lich_thi(page):
-    """Trả về {"anh": path, "hash": ...} nếu có lịch thi sắp tới, ngược lại None."""
-    log("📝 Lịch thi...")
-    mo_trang(page, URL_LICH_THI)
-    page.wait_for_selector(".page-content", timeout=TIMEOUT_ELEMENT)
-    cho_text_on_dinh(page, CSS_BANG_THI)
-
-    ngay = hom_nay()
-    dong = dong_thi_sap_toi(page, ngay)
-
-    if not dong:
+def _ngay_thi(phong_thi):
+    """Ưu tiên chuỗi ngày mà web hiển thị (dd/mm/yyyy); không có thì dùng timestamp."""
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", phong_thi.get("examDateString") or "")
+    if m:
+        d, thang, nam = map(int, m.groups())
         try:
-            page.locator(SEL_DROPDOWN).first.wait_for(timeout=TIMEOUT_ELEMENT)
-        except PWTimeout:
-            raise RuntimeError("Trang lịch thi không load được ô chọn.")
-
-        if page.locator(SEL_DROPDOWN).count() < 2:
-            raise RuntimeError("Trang lịch thi thiếu ô chọn Năm học/Học kỳ.")
-
-        for i in range(SO_NAM_HOC_THI):
-            if dong or not chon_dropdown(page, 0, CSS_BANG_THI, vi_tri=i):
-                break
-            for loai in LOAI_HOC_KY:
-                if not chon_dropdown(page, 1, CSS_BANG_THI, text=loai):
-                    continue
-                if page.locator(SEL_DROPDOWN).count() >= 3:
-                    chon_dropdown(page, 2, CSS_BANG_THI, vi_tri=0)   # đợt thi mới nhất
-                dong = dong_thi_sap_toi(page, ngay)
-                if dong:
-                    break
-
-    if not dong:
-        log("✅ Không có lịch thi sắp tới")
+            return datetime(nam, thang, d).date()
+        except ValueError:
+            pass
+    try:
+        return ms_sang_ngay(phong_thi["examDate"]) if phong_thi.get("examDate") else None
+    except (TypeError, ValueError, OSError):
         return None
 
-    vung = page.locator(".portlet-body:visible").last
-    if vung.count() == 0:
-        vung = page.locator(".page-content").first
-    path = chup(vung, "anh_lich_thi.png")
 
-    dau_van_tay = hashlib.sha256("\n".join(sorted(dong)).encode()).hexdigest()
-    log(f"✅ Có {len(dong)} môn thi sắp tới, đã chụp")
-    return {"anh": path, "hash": dau_van_tay}
+def tach_lich_thi(ds, nguon):
+    """
+    JSON lịch thi -> danh sách môn thi gọn.
+    KHÔNG bỏ môn nào: không đọc được ngày thì để ngay = "" và vẫn báo ("chưa rõ ngày").
+    `nguon` = "hk|đợt|lần" để nhận ra cùng một môn khi phòng/giờ thay đổi.
+    """
+    ket_qua = []
+    for e in ds or []:
+        p = e.get("examRoom") or {}
+        ngay = _ngay_thi(p)
+        gio = p.get("examHour") or {}
+        mon_hoc = (p.get("semesterSubjectExam") or {}).get("subject") or {}
+        mon = mon_hoc.get("subjectName") or e.get("subjectName") or "Môn thi (chưa rõ tên)"
+        ket_qua.append({
+            "id": f"{nguon}|{mon_hoc.get('subjectCode') or mon}",
+            "nguon": nguon,
+            "lan": int(nguon.rsplit("|", 1)[-1]),
+            "ngay": ngay.isoformat() if ngay else "",
+            "ngay_web": (p.get("examDateString") or "").strip(),
+            "bat_dau": gio.get("startString") or "",
+            "ket_thuc": gio.get("endString") or "",
+            "ca": gio.get("name") or "",
+            "mon": mon,
+            "sbd": str(e.get("examCode") or ""),
+            "phong": ((p.get("room") or {}).get("name") or "").strip(),
+            "dot": e.get("examPeriodCode") or "",
+        })
+    return ket_qua
+
+
+def _d(t):
+    return datetime.fromisoformat(t["ngay"]).date() if t["ngay"] else None
+
+
+def con_lien_quan(t, ngay):
+    """Môn chưa thi (hoặc chưa rõ ngày thì vẫn giữ để không bỏ sót)."""
+    return not t["ngay"] or t["ngay"] >= ngay.isoformat()
+
+
+def _gio(t):
+    return f"{t['bat_dau']}–{t['ket_thuc']}" if t["bat_dau"] else (t["ca"] or "chưa rõ giờ")
+
+
+def _ngay_hien_thi(t):
+    if t["ngay"]:
+        return f"{TEN_THU[_d(t).weekday()]} {_d(t):%d/%m/%Y}"
+    return f"chưa rõ ngày ({t['ngay_web']}) - xem trên web" if t["ngay_web"] else "chưa rõ ngày - xem trên web"
+
+
+def _ten_thi(t):
+    return f"{t['mon']} (thi lại lần {t['lan']})" if t.get("lan", 1) > 1 else t["mon"]
+
+
+def dong_thi(t, kem_ngay=True, thay_doi=()):
+    phan = [f"📝 {_ten_thi(t)}"]
+    phan += [f"⚠️ {x}" for x in thay_doi]          # vd "⚠️ Phòng: 301-A2 → 205-A2"
+    phan.append((f"🗓️ {_ngay_hien_thi(t)} · " if kem_ngay else "🕐 ") + _gio(t))
+    chi_tiet = " · ".join(x for x in (f"📍 {t['phong']}" if t["phong"] else "",
+                                     f"SBD {t['sbd']}" if t["sbd"] else "") if x)
+    if chi_tiet:
+        phan.append(chi_tiet)
+    return "\n".join(phan)
+
+
+_TRUONG_SO_SANH = (("ngay", "Ngày", _ngay_hien_thi), ("bat_dau", "Giờ", _gio),
+                   ("phong", "Phòng", lambda t: t["phong"] or "?"), ("sbd", "SBD", lambda t: t["sbd"] or "?"))
+
+
+def so_sanh_thi(cu, moi):
+    """Các dòng mô tả thay đổi, vd 'Phòng: 301-A2 → 205-A2'."""
+    return [f"{ten}: {hien(cu)} → {hien(moi)}" for k, ten, hien in _TRUONG_SO_SANH if cu.get(k) != moi.get(k)]
 
 
 # =========================================================
 # HỌC PHÍ
 # =========================================================
 
-def kiem_tra_hoc_phi(page):
-    """Trả về {"anh": path, "tin": ...} nếu còn nợ, ngược lại None."""
-    log("💰 Học phí...")
-    mo_trang(page, URL_HOC_PHI)
-    page.wait_for_selector(".page-content", timeout=TIMEOUT_ELEMENT)
+def tach_hoc_phi(js):
+    con_no = js.get("differenceAmount")
+    if con_no is None:
+        con_no = js.get("totalReceiveAbleNotComplete") or 0
+    return {
+        "phai_dong": js.get("totalReceiveAble") or 0,
+        "da_dong": js.get("totalReceived") or 0,
+        "con_no": con_no,
+        "chi_tiet": [
+            (x.get("note") or "Khoản chưa đóng", x.get("amountAfterBalance") or x.get("amount") or 0)
+            for x in js.get("receiveAbleNotCompleteDtos") or []
+        ],
+    }
 
-    o_tien = page.locator("strong.font-red").first
+
+def tin_hoc_phi(hp, tieu_de):
+    dong = [tieu_de,
+            f"Phải đóng: {tien(hp['phai_dong'])}đ · Đã đóng: {tien(hp['da_dong'])}đ",
+            f"👉 Còn phải đóng: {tien(hp['con_no'])}đ"]
+    dong += [f"  • {ten}: {tien(so)}đ" for ten, so in hp["chi_tiet"]]
+    return "\n".join(dong)
+
+
+# =========================================================
+# TIN NHẮN LỊCH
+# =========================================================
+
+def tin_hom_nay(buoi, thi, ngay):
+    tieu_de = f"{TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}"
+    hoc = buoi_trong_ngay(buoi, ngay)
+    thi_nay = sorted((t for t in thi if t["ngay"] == ngay.isoformat()), key=lambda t: t["bat_dau"])
+    phan = []
+
+    if thi_nay:
+        phan.append(f"🚨 HÔM NAY THI {len(thi_nay)} MÔN:")
+        phan += [dong_thi(t, kem_ngay=False) for t in thi_nay]
+
+    if hoc:
+        phan.append(f"☀️ {tieu_de} - hôm nay có {len(hoc)} buổi học:")
+        for b in hoc:
+            dong = [f"🕐 {b['bat_dau']}–{b['ket_thuc']}" + (f" (tiết {b['tiet']})" if b["tiet"] else ""),
+                    f"📘 {_ten_mon(b)}"]
+            chi_tiet = " · ".join(x for x in (f"📍 {b['phong']}" if b["phong"] else "",
+                                             f"👤 {b['gv']}" if b["gv"] else "") if x)
+            if chi_tiet:
+                dong.append(chi_tiet)
+            phan.append("\n".join(dong))
+    elif thi_nay:
+        phan.append(f"📚 {tieu_de}: không có lịch học.")
+    else:
+        phan.append(f"😴 {tieu_de}\nHôm nay không có lịch học. Nghỉ!")
+    return "\n\n".join(phan)
+
+
+def tin_tuan(buoi, thi, ngay):
+    """Tổng quan cả tuần (gửi sáng thứ Hai)."""
+    dau = ngay - timedelta(days=ngay.weekday())
+    khoang = f"({dau:%d/%m} - {dau + timedelta(days=6):%d/%m})"
+    dong, tong = [f"📅 Lịch học tuần này {khoang}"], 0
+    for k in range(7):
+        trong_ngay = buoi_trong_ngay(buoi, dau + timedelta(days=k))
+        tong += len(trong_ngay)
+        if not trong_ngay:
+            dong.append(f"\n{TEN_THU[k]}: nghỉ")
+            continue
+        dong.append(f"\n{TEN_THU[k]}:")
+        for b in trong_ngay:
+            phong = f" · {b['phong']}" if b["phong"] else ""
+            dong.append(f"  • {b['bat_dau']} {_ten_mon(b)}{phong}")
+    if tong == 0:
+        dong = [f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!"]
+
+    sap_toi = [t for t in thi if con_lien_quan(t, ngay)]
+    if sap_toi:
+        dong.append(f"\n\n📝 Lịch thi sắp tới ({len(sap_toi)} môn):")
+        for t in sap_toi:
+            ngay_t = f"{_d(t):%d/%m}" if t["ngay"] else "chưa rõ ngày"
+            gio = f" {t['bat_dau']}" if t["bat_dau"] else ""
+            dong.append(f"  • {ngay_t}{gio} {_ten_thi(t)}" + (f" · {t['phong']}" if t["phong"] else ""))
+    return "\n".join(dong)
+
+
+# =========================================================
+# LẤY DỮ LIỆU
+# =========================================================
+
+def lay_lich_hoc(api, hk):
+    cac_mon = api.get(API_LICH_HOC.format(hk=hk["id"]))
+    buoi = tach_buoi_hoc(cac_mon)
+    if cac_mon and not buoi:
+        raise RuntimeError("API trả dữ liệu lịch học nhưng không đọc được buổi nào.")
+    log(f"✅ Lịch học: {len(cac_mon)} lớp, {len(buoi)} khung giờ")
+    return buoi
+
+
+def hoc_ky_can_xem_thi(api, hk_hien_tai, ngay):
+    """Học kỳ hiện tại + học kỳ vừa kết thúc / sắp bắt đầu (lúc giao học kỳ vẫn không sót)."""
+    ket_qua = {hk_hien_tai["id"]: hk_hien_tai.get("semesterName") or hk_hien_tai["id"]}
     try:
-        o_tien.wait_for(state="visible", timeout=TIMEOUT_HOC_PHI)
-    except PWTimeout:
-        log("✅ Không thấy khoản nợ")
-        return None
-
-    chuoi = o_tien.inner_text().strip()
-    so = re.sub(r"\D", "", chuoi)
-    if not so:
-        raise RuntimeError(f"Không đọc được số tiền nợ: {chuoi!r}")
-    if int(so) <= 0:
-        log("✅ Không còn nợ")
-        return None
-
-    vung = page.locator(".portlet-body:visible").first
-    if vung.count() == 0:
-        vung = page.locator(".page-content").first
-    path = chup(vung, "anh_hoc_phi.png")
-
-    # Không in số tiền ra log: log GitHub Actions của repo public ai cũng xem được.
-    log("🚨 Còn khoản học phí chưa đóng, đã chụp")
-    return {"anh": path, "tin": f"🚨 CẢNH BÁO HỌC PHÍ: {chuoi} VNĐ"}
-
-
-# =========================================================
-# CÀO DỮ LIỆU
-# =========================================================
-
-CAC_MUC = (
-    ("lich_hoc", "Lịch học", cao_lich_hoc),
-    ("lich_thi", "Lịch thi", cao_lich_thi),
-    ("hoc_phi", "Học phí", kiem_tra_hoc_phi),
-)
-
-
-def chay_muc(page, khoa, ten, ham):
-    """
-    Chạy một mục có retry. Mỗi lần thử lại bắt đầu từ trang trắng để Angular load mới
-    hoàn toàn (goto cùng URL chỉ khác #hash thì trình duyệt KHÔNG tải lại trang).
-    """
-    for i in range(1, MAX_RETRY_MUC + 1):
-        try:
-            if i > 1:
-                page.goto("about:blank")
-            return ham(page)
-        except Exception as e:
-            log(f"⚠️ {ten} lỗi ({i}/{MAX_RETRY_MUC}): {e}")
-            loi = e
-    raise RuntimeError(f"{ten}: {ngan_gon(loi)}") from loi
-
-
-def scrape_mot_lan(msv, password, cac_muc):
-    global _mang
-    ket_qua = {"loi": []}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-        try:
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                device_scale_factor=DEVICE_SCALE,
-                locale="vi-VN",
-                timezone_id="Asia/Ho_Chi_Minh",
-            )
-            page = context.new_page()
-            _mang = TheoDoiMang(page)
-            page.set_default_timeout(TIMEOUT_ELEMENT)
-            page.set_default_navigation_timeout(TIMEOUT_NAV)
-
+        for h in (api.get(API_DS_HOC_KY) or {}).get("content") or []:
             try:
-                dang_nhap(page, msv, password)
-            except Exception:
-                chup_debug(page, "dang_nhap")
-                raise
-
-            # Mỗi mục độc lập: một mục hỏng không làm mất kết quả của mục khác,
-            # cũng không phải đăng nhập lại từ đầu.
-            for khoa, ten, ham in cac_muc:
-                try:
-                    ket_qua[khoa] = chay_muc(page, khoa, ten, ham)
-                except Exception as e:
-                    ket_qua["loi"].append((str(e), chup_debug(page, khoa)))
-                    dong_dropdown(page)
-        finally:
-            browser.close()
-
+                bat_dau, ket_thuc = ms_sang_ngay(h["startDate"]), ms_sang_ngay(h["endDate"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if bat_dau - timedelta(days=THI_TRUOC_HK_NGAY) <= ngay <= ket_thuc + timedelta(days=THI_SAU_HK_NGAY):
+                ket_qua[h["id"]] = h.get("semesterName") or h["id"]
+    except Exception as e:
+        log(f"⚠️ Không lấy được danh sách học kỳ, chỉ xem học kỳ hiện tại: {ngan_gon(e)}")
     return ket_qua
 
 
-def scrape_data(msv, password, cac_muc=CAC_MUC):
-    """Retry cả phiên chỉ khi lỗi ở mức trình duyệt/đăng nhập. Sai mật khẩu thì dừng ngay."""
-    loi = None
-    for i in range(1, MAX_RETRY_SCRAPE + 1):
-        log(f"\n===== PHIÊN {i}/{MAX_RETRY_SCRAPE} =====")
+def lay_lich_thi(api, hk, ngay, state):
+    """
+    Hỏi mọi (học kỳ liên quan × đợt × lần thi), song song cho nhanh.
+    Nguồn nào lỗi thì dùng lại kết quả lần trước của chính nguồn đó (state["thi_nguon"]),
+    để một request lỗi không làm "biến mất" môn thi.
+    Trả về (danh sách môn thi, tập nguồn tải thành công lần này).
+    """
+    cache = state.setdefault("thi_nguon", {})
+    nguon = []
+    for hk_id, ten_hk in hoc_ky_can_xem_thi(api, hk, ngay).items():
         try:
-            return scrape_mot_lan(msv, password, cac_muc)
-        except LoiDangNhap:
-            raise
+            cac_dot = [d["id"] for d in api.get(API_DOT.format(hk=hk_id)) or []]
+            state.setdefault("thi_dot", {})[str(hk_id)] = cac_dot
         except Exception as e:
-            loi = e
-            log(f"❌ Phiên {i} lỗi: {e}")
-            if i < MAX_RETRY_SCRAPE:
-                time.sleep(10)
-    raise RuntimeError(f"Thử {MAX_RETRY_SCRAPE} phiên đều lỗi: {ngan_gon(loi)}")
+            cac_dot = state.get("thi_dot", {}).get(str(hk_id), [])
+            log(f"⚠️ Không lấy được đợt thi {ten_hk}, dùng danh sách đã lưu: {ngan_gon(e)}")
+        nguon += [(hk_id, dot, lan) for dot in cac_dot for lan in LAN_THI]
+
+    def tai(n):
+        hk_id, dot, lan = n
+        return tach_lich_thi(api.get(API_LICH_THI.format(hk=hk_id, dot=dot, lan=lan)), f"{hk_id}|{dot}|{lan}")
+
+    thi, ok, loi_khong_cache = [], set(), []
+    with ThreadPoolExecutor(SO_LUONG_SONG_SONG) as pool:
+        for n, kq in zip(nguon, pool.map(lambda n: _an_toan(tai, n), nguon)):
+            khoa = "|".join(map(str, n))
+            if isinstance(kq, Exception):
+                if khoa in cache:
+                    thi += cache[khoa]                       # dùng kết quả lần trước
+                else:
+                    loi_khong_cache.append(kq)
+                continue
+            ok.add(khoa)
+            if kq:
+                cache[khoa] = kq
+                thi += kq
+            else:
+                cache.pop(khoa, None)
+
+    if nguon and not ok:
+        raise RuntimeError(f"Không tải được lịch thi: {ngan_gon(loi_khong_cache[0]) if loi_khong_cache else 'lỗi'}")
+    if loi_khong_cache:
+        log(f"⚠️ {len(loi_khong_cache)} nguồn lịch thi lỗi và chưa có bản lưu (sẽ thử lại lần sau)")
+
+    # bỏ trùng theo id, sắp theo ngày (môn chưa rõ ngày xếp đầu cho dễ thấy)
+    gop = {t["id"]: t for t in thi}
+    ket_qua = sorted(gop.values(), key=lambda t: (t["ngay"], t["bat_dau"], t["mon"]))
+    log(f"✅ Lịch thi: {len(ket_qua)} môn, {len(ok)}/{len(nguon)} nguồn tải được")
+    return ket_qua, ok, len(loi_khong_cache)
+
+
+def _an_toan(ham, *args):
+    try:
+        return ham(*args)
+    except Exception as e:
+        log(f"⚠️ Lịch thi {args[0]}: {ngan_gon(e)}")
+        return e
+
+
+def lay_hoc_phi(api):
+    hp = tach_hoc_phi(api.get(API_HOC_PHI))
+    log("✅ Học phí: " + ("còn nợ" if hp["con_no"] > 0 else "đã đóng đủ"))   # không in số tiền ra log public
+    return hp
 
 
 # =========================================================
@@ -817,7 +533,7 @@ class Telegram:
                     except Exception:
                         pass
                 elif r.status_code < 500:
-                    # Lỗi do request (chat_id sai, ảnh quá lớn...): thử lại cũng vô ích.
+                    # Lỗi do request (chat_id sai...): thử lại cũng vô ích.
                     log(f"❌ Telegram {method} lỗi {r.status_code}: {r.text}")
                     return False
                 log(f"⚠️ Telegram {r.status_code}, thử lại sau {cho}s")
@@ -831,68 +547,6 @@ class Telegram:
     def tin(self, text):
         return self._goi("sendMessage", {"text": text[:4096]})
 
-    def anh(self, path, caption=""):
-        try:
-            noi_dung = Path(path).read_bytes()
-        except OSError as e:
-            log(f"❌ Không đọc được ảnh {path}: {e}")
-            return False
-        return self._goi(
-            "sendPhoto",
-            {"caption": caption[:1024]},
-            files={"photo": (Path(path).name, noi_dung, "image/png")},
-        )
-
-
-# =========================================================
-# CHẾ ĐỘ CHẠY
-# =========================================================
-
-CAC_CHE_DO = ("tuan", "ngay", "hoc")
-ANH_LICH_TUAN = "lich_tuan.png"   # ảnh lịch tuần lưu trong STATE_DIR
-
-
-def dau_tuan_cua(ngay):
-    return ngay - timedelta(days=ngay.weekday())
-
-
-def co_lich_tuan_nay(state, ngay):
-    return (state.get("lich_tuan") or {}).get("tuan") == dau_tuan_cua(ngay).isoformat()
-
-
-def chon_che_do(yeu_cau, state, ngay):
-    """
-    tuan: thứ Hai (hoặc khi bấm chạy tay chọn tuan)
-    ngay: đã có lịch tuần này được lưu -> chỉ đọc và báo
-    hoc : chưa có lịch tuần này (thứ Hai lỗi / cache bị xóa) -> quét riêng lịch học
-    """
-    if yeu_cau in CAC_CHE_DO:
-        return yeu_cau
-    if ngay.weekday() == 0:
-        return "tuan"
-    return "ngay" if co_lich_tuan_nay(state, ngay) else "hoc"
-
-
-def bao_lich_hom_nay(tg, state, ngay):
-    lich_tuan = state.get("lich_tuan") or {}
-    tin = tin_lich_hom_nay(lich_tuan, ngay)
-    if tin is not None:
-        return tg.tin(tin)
-    anh = STATE_DIR / ANH_LICH_TUAN
-    if anh.exists():
-        return tg.anh(str(anh), f"📌 {TEN_THU[ngay.weekday()]} {ngay:%d/%m}: xem lịch hôm nay trong ảnh tuần")
-    return tg.tin(f"⚠️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m}: không đọc được lịch hôm nay.")
-
-
-def luu_lich_tuan(state, lh):
-    state["lich_tuan"] = {"tuan": lh["tuan"], "ngay": lh["ngay"]}
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    anh = STATE_DIR / ANH_LICH_TUAN
-    if lh.get("anh"):
-        anh.write_bytes(Path(lh["anh"]).read_bytes())
-    elif anh.exists():
-        anh.unlink()
-
 
 # =========================================================
 # MAIN
@@ -900,38 +554,18 @@ def luu_lich_tuan(state, lh):
 
 def main(argv):
     ngay = hom_nay()
-    state = doc_state()
-    yeu_cau = next((a for a in argv if not a.startswith("-")), "auto")
-    che_do = chon_che_do(yeu_cau, state, ngay)
-
-    if "--che-do" in argv:
-        # Workflow dùng để biết có cần cài Playwright + Chromium không.
-        print(che_do)
-        out = os.environ.get("GITHUB_OUTPUT")
-        if out:
-            with open(out, "a", encoding="utf-8") as f:
-                f.write(f"che_do={che_do}\n")
-        return 0
-
-    log(f"🗓️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y} - chế độ: {che_do}")
+    yeu_cau = argv[0] if argv else "auto"
+    thu_hai = yeu_cau == "tuan" or (yeu_cau != "ngay" and ngay.weekday() == 0)
+    log(f"🗓️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}" + (" (bản thứ Hai)" if thu_hai else ""))
 
     token = os.environ.get("TELE_BOT_TOKEN")
     chat_id = os.environ.get("TELE_CHAT_ID")
     if not token or not chat_id:
         log("❌ Thiếu TELE_BOT_TOKEN hoặc TELE_CHAT_ID")
         return 1
-
     tg = Telegram(token, chat_id)
     link = link_lan_chay()
     duoi = f"\nXem log: {link}" if link else ""
-
-    # ---- Chế độ ngày: không cần trình duyệt
-    if che_do == "ngay":
-        return 0 if bao_lich_hom_nay(tg, state, ngay) else 1
-
-    if sync_playwright is None:
-        log("❌ Chưa cài Playwright mà chế độ này cần trình duyệt")
-        return 1
 
     msv = os.environ.get("MSV")
     password = os.environ.get("PASS_TRUONG")
@@ -939,60 +573,119 @@ def main(argv):
         tg.tin("❌ Bot lịch học: thiếu secret MSV hoặc PASS_TRUONG." + duoi)
         return 1
 
-    cac_muc = CAC_MUC if che_do == "tuan" else CAC_MUC[:1]
+    state = doc_state()
+    loi = []          # (mục, lỗi) để báo ở cuối
+
+    # ---- Đăng nhập + học kỳ hiện tại
+    api = hk = None
     try:
-        kq = scrape_data(msv, password, cac_muc)
+        api = TluApi(msv, password)
+        api.dang_nhap()
+        hk = api.get(API_HOC_KY)
+        log(f"✅ Đăng nhập OK, học kỳ {hk.get('semesterName')}")
+    except LoiDangNhap as e:
+        tg.tin(f"❌ Bot lịch học: {e} Hãy cập nhật secret PASS_TRUONG.")
+        return 1          # dừng hẳn, không thử lại để tránh khóa tài khoản
     except Exception as e:
-        if isinstance(e, LoiDangNhap):
-            tg.tin(f"❌ Bot lịch học: {e} Hãy cập nhật secret PASS_TRUONG.")
-        else:
-            tg.tin(f"❌ Bot lịch học không lấy được dữ liệu.\n{ngan_gon(e)}{duoi}")
-        if Path("debug_dang_nhap.png").exists():
-            tg.anh("debug_dang_nhap.png", "Ảnh màn hình lúc lỗi")
-        return 1
+        loi.append(("Đăng nhập", e))
+        api = None
 
-    # ---- Lịch học: lưu cả tuần, gửi ảnh tuần (thứ Hai) + lịch hôm nay
-    lh = kq.get("lich_hoc")
-    if lh:
-        luu_lich_tuan(state, lh)
-        ghi_state(state)
-        if lh.get("anh"):
-            if che_do == "tuan":
-                tg.anh(lh["anh"], "📌 Lịch học tuần này")
-            if lh["ngay"] is not None or che_do != "tuan":
-                bao_lich_hom_nay(tg, state, ngay)   # (đã gửi ảnh tuần thì khỏi gửi lại)
-        elif che_do == "tuan":
-            tg.tin(lh["tin"])               # cả tuần nghỉ: 1 tin là đủ
-        else:
-            bao_lich_hom_nay(tg, state, ngay)
+    def lay(muc, ham, khoa_luu):
+        """Lấy 1 mục qua API, lỗi thì dùng bản đã lưu. Trả (dữ liệu hoặc None, là_dữ_liệu_mới)."""
+        if api is not None:
+            try:
+                du_lieu = ham()
+                state[khoa_luu] = {"luc": datetime.now(VN_TZ).isoformat(timespec="minutes"),
+                                   "du_lieu": du_lieu}
+                return du_lieu, True
+            except Exception as e:
+                loi.append((muc, e))
+        da_luu = state.get(khoa_luu)
+        return (da_luu["du_lieu"] if da_luu else None), False
 
-    # ---- Lịch thi (báo rõ là mới hay chỉ nhắc lại)
-    lt = kq.get("lich_thi")
-    if lt:
-        moi = lt["hash"] != state.get("lich_thi_hash")
-        caption = "🚨 CÓ LỊCH THI MỚI" if moi else "📝 Nhắc lịch thi sắp tới (không đổi)"
-        if tg.anh(lt["anh"], caption):
-            state["lich_thi_hash"] = lt["hash"]
-    elif "lich_thi" in kq:
-        # Cào thành công và không còn lịch thi -> lần sau có lịch sẽ báo là mới.
-        state.pop("lich_thi_hash", None)
+    # Mỗi mục độc lập: mục này lỗi không ảnh hưởng mục khác.
+    buoi, buoi_moi = lay("Lịch học", lambda: lay_lich_hoc(api, hk), "lich_hoc")
+    thi, thi_ok, thi_moi = None, set(), False
+    if api is not None:
+        try:
+            thi, thi_ok, so_loi = lay_lich_thi(api, hk, ngay, state)
+            state["lich_thi"] = {"luc": datetime.now(VN_TZ).isoformat(timespec="minutes"), "du_lieu": thi}
+            thi_moi = True
+            if so_loi and thu_hai:   # lỗi lẻ tẻ: chỉ báo vào thứ Hai cho đỡ phiền, ngày khác chỉ ghi log
+                loi.append(("Lịch thi", RuntimeError(f"{so_loi} đợt thi không tải được (bot vẫn thử lại hằng ngày)")))
+        except Exception as e:
+            loi.append(("Lịch thi", e))
+    if not thi_moi and state.get("lich_thi"):
+        thi = state["lich_thi"]["du_lieu"]
+    hp, hp_moi = lay("Học phí", lambda: lay_hoc_phi(api), "hoc_phi")
+
+    ghi_chu = ""
+    if buoi is not None and not buoi_moi:
+        luc = datetime.fromisoformat(state["lich_hoc"]["luc"])
+        ghi_chu = f"\n\n⚠️ Web trường đang lỗi, lịch lấy từ bản lưu lúc {luc:%H:%M %d/%m}."
+
+    # ---- 1. Tổng quan tuần (thứ Hai)
+    if thu_hai and buoi is not None:
+        tg.tin(tin_tuan(buoi, thi or [], ngay) + ghi_chu)
+
+    # ---- 2. Lịch hôm nay (kèm môn thi hôm nay)
+    if buoi is not None:
+        tg.tin(tin_hom_nay(buoi, thi or [], ngay) + ghi_chu)
+
+    # ---- 3. Lịch thi mới / thay đổi / bị gỡ (so với lần đã báo trước)
+    if thi_moi:
+        da_bao = state.get("thi_da_bao")
+        da_bao = da_bao if isinstance(da_bao, dict) else {}      # bỏ định dạng cũ
+        hien_tai = {t["id"]: t for t in thi if con_lien_quan(t, ngay)}
+        moi = [t for i, t in hien_tai.items() if i not in da_bao]
+        doi = [(da_bao[i], t) for i, t in hien_tai.items() if i in da_bao and so_sanh_thi(da_bao[i], t)]
+        # Chỉ coi là "bị gỡ" khi nguồn của môn đó tải THÀNH CÔNG lần này (tránh báo nhầm lúc web lỗi).
+        go = [c for i, c in da_bao.items()
+              if i not in hien_tai and c.get("nguon") in thi_ok and con_lien_quan(c, ngay)]
+
+        phan = []
+        if moi:
+            phan.append(f"🚨 CÓ LỊCH THI MỚI ({len(moi)} môn):\n\n" + "\n\n".join(dong_thi(t) for t in moi))
+        if doi:
+            phan.append("🔄 LỊCH THI THAY ĐỔI:\n\n" + "\n\n".join(dong_thi(t, thay_doi=so_sanh_thi(c, t)) for c, t in doi))
+        if go:
+            phan.append("🗑️ LỊCH THI BỊ GỠ KHỎI WEB (kiểm tra lại với trường):\n\n"
+                        + "\n\n".join(dong_thi(c) for c in go))
+
+        if not phan or tg.tin("\n\n━━━━━━━━━━\n\n".join(phan)):
+            # Nhớ trạng thái mới; giữ lại môn có nguồn lỗi lần này để không báo "gỡ" nhầm.
+            giu = {i: c for i, c in da_bao.items()
+                   if i not in hien_tai and c.get("nguon") not in thi_ok and con_lien_quan(c, ngay)}
+            state["thi_da_bao"] = {**giu, **hien_tai}
+
+    # ---- 4. Nhắc thi ngày mai
+    mai = (ngay + timedelta(days=1)).isoformat()
+    thi_mai = [t for t in (thi or []) if t["ngay"] == mai]
+    if thi_mai:
+        tg.tin(f"⏰ NGÀY MAI THI {len(thi_mai)} MÔN:\n\n" + "\n\n".join(dong_thi(t) for t in thi_mai))
+
+    # ---- 5. Học phí: báo khi số còn phải đóng thay đổi; thứ Hai nhắc lại nếu còn nợ
+    if hp_moi:
+        truoc = state.get("hoc_phi_con_no")
+        if truoc is None or round(truoc) != round(hp["con_no"]):
+            if hp["con_no"] > 0:
+                tg.tin(tin_hoc_phi(hp, "💰 HỌC PHÍ THAY ĐỔI" if truoc is not None else "💰 HỌC PHÍ"))
+            elif truoc:
+                tg.tin(f"✅ Học phí đã đóng đủ! (đã đóng {tien(hp['da_dong'])}đ)")
+            state["hoc_phi_con_no"] = hp["con_no"]
+        elif thu_hai and hp["con_no"] > 0:
+            tg.tin(tin_hoc_phi(hp, "💰 NHẮC HỌC PHÍ"))
+
     ghi_state(state)
 
-    # ---- Học phí
-    hp = kq.get("hoc_phi")
-    if hp:
-        tg.anh(hp["anh"], hp["tin"])
-
-    # ---- Lỗi từng mục: báo kèm ảnh màn hình qua Telegram (riêng tư),
-    #      không upload lên GitHub vì repo public ai cũng tải được.
-    if kq["loi"]:
-        tg.tin("⚠️ Một số mục bị lỗi:\n" + "\n".join(f"• {m}" for m, _ in kq["loi"]) + duoi)
-        for m, anh in kq["loi"]:
-            if anh:
-                tg.anh(anh, f"Ảnh lúc lỗi: {m[:200]}")
+    # ---- 6. Báo lỗi (nếu có)
+    if loi:
+        if buoi is None:
+            tg.tin("❌ Bot không lấy được lịch học và chưa có dữ liệu lưu.")
+        tg.tin("⚠️ Một số mục bị lỗi:\n" + "\n".join(f"• {m}: {ngan_gon(e)}" for m, e in loi) + duoi)
         return 1
 
-    log("\n🏁 Xong!")
+    log("🏁 Xong!")
     return 0
 
 
