@@ -2,26 +2,46 @@ name: Telegram Schedule Bot
 
 on:
   schedule:
-   - cron: '0 22 * * 0' # Chạy 6h sáng VN
+    # 22:47 UTC Chủ nhật = 05:47 sáng thứ Hai giờ VN.
+    # Tránh mốc tròn giờ vì GitHub hay trễ 10–30 phút lúc đó -> tin tới khoảng 6h.
+    - cron: '47 22 * * 0'
   workflow_dispatch:
+
+# Không cho 2 lần chạy chồng nhau (vd: bấm tay đúng lúc cron chạy).
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+          cache: pip
 
-      # --- ĐOẠN NÀY ĐÃ ĐƯỢC BỔ SUNG PLAYWRIGHT ---
-      - name: Cài đặt thư viện
+      - name: Cài thư viện
         run: |
-          pip install requests playwright
-          python -m playwright install chromium
+          pip install -r requirements.txt
+          # Chỉ cài bản headless (nhẹ hơn ~100MB so với Chromium đầy đủ).
+          python -m playwright install --with-deps --only-shell chromium
+
+      # Nhớ lịch thi đã báo lần trước để phân biệt "mới" và "nhắc lại".
+      # (GitHub xóa cache không dùng quá 7 ngày; nếu bị xóa, bot chỉ báo "mới" thêm 1 lần.)
+      - name: Khôi phục trạng thái
+        uses: actions/cache/restore@v4
+        with:
+          path: .bot_state
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
 
       - name: Run Bot
         env:
@@ -31,10 +51,9 @@ jobs:
           PASS_TRUONG: ${{ secrets.PASS_TRUONG }}
         run: python bot_telegram.py
 
-      # Tải ảnh về nếu web trường cản đường
-      - name: Lưu ảnh lỗi (Nếu có)
-        uses: actions/upload-artifact@v4
+      - name: Lưu trạng thái
         if: always()
+        uses: actions/cache/save@v4
         with:
-          name: loi-cao-web-truong
-          path: debug_web.png
+          path: .bot_state
+          key: bot-state-${{ github.run_id }}
