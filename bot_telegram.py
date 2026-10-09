@@ -31,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -114,6 +115,101 @@ def link_lan_chay():
 
 
 # =========================================================
+# SSL: BỔ SUNG CHỨNG CHỈ TRUNG GIAN MÀ MÁY CHỦ TRƯỜNG GỬI THIẾU
+# =========================================================
+#
+# Máy chủ web trường không gửi kèm chứng chỉ trung gian (intermediate certificate).
+# Trình duyệt tự tải mắt xích còn thiếu nên vẫn vào được web, còn Python thì báo
+# CERTIFICATE_VERIFY_FAILED. Thay vì TẮT kiểm tra SSL (nguy hiểm: mật khẩu đi qua kết nối
+# không xác minh), bot làm giống trình duyệt:
+#   1. Đọc chứng chỉ công khai của máy chủ (không gửi dữ liệu gì qua kết nối này).
+#   2. Lấy địa chỉ tải chứng chỉ trung gian ghi sẵn trong đó (mục "CA Issuers"), tải về.
+#   3. Ghép với bộ chứng chỉ gốc tin cậy (certifi) rồi XÁC MINH ĐẦY ĐỦ như bình thường.
+# Chứng chỉ tải về không thể giả mạo được: nó vẫn phải được chứng chỉ gốc tin cậy ký.
+
+CA_BUNDLE = STATE_DIR / "ca_bundle.pem"
+
+
+def _doc_chung_chi(data):
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import pkcs7
+    for nap in (x509.load_der_x509_certificate, x509.load_pem_x509_certificate):
+        try:
+            return [nap(data)]
+        except ValueError:
+            pass
+    for nap in (pkcs7.load_der_pkcs7_certificates, pkcs7.load_pem_pkcs7_certificates):
+        try:
+            return list(nap(data))
+        except ValueError:
+            pass
+    raise ValueError("Không đọc được chứng chỉ tải về")
+
+
+def tao_ca_bundle(host, port=443):
+    import socket
+    import ssl
+    import certifi
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE        # CHỈ để đọc chứng chỉ công khai, không gửi gì
+    with socket.create_connection((host, port), timeout=TIMEOUT_API) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as tls:
+            la = cert = x509.load_der_x509_certificate(tls.getpeercert(binary_form=True))
+
+    them = []
+    for _ in range(4):                     # đi ngược chuỗi chứng chỉ tới gốc
+        try:
+            aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+        except x509.ExtensionNotFound:
+            break
+        urls = [d.access_location.value for d in aia
+                if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+        if not urls:
+            break
+        cha = _doc_chung_chi(requests.get(urls[0], timeout=TIMEOUT_API).content)[0]
+        them.append(cha)
+        if cha.issuer == cha.subject:      # đã tới chứng chỉ gốc
+            break
+        cert = cha
+    if not them:
+        raise RuntimeError("Chứng chỉ web trường không ghi nơi tải chứng chỉ trung gian.")
+
+    # XÁC MINH trước khi tin: chuỗi lá -> trung gian phải được một chứng chỉ GỐC TIN CẬY ký
+    # và đúng tên miền. Bắt buộc, vì Python 3.13 coi mọi chứng chỉ trong bộ tin cậy là "gốc"
+    # (partial chain): nếu thêm bừa chứng chỉ tải về, kẻ giả mạo có thể tự làm trung gian.
+    goc = Path(certifi.where()).read_bytes()
+    chuoi = _xac_minh_chuoi(host, la, them, goc)
+    trung_gian = chuoi[1:-1]               # bỏ chứng chỉ lá và chứng chỉ gốc (đã có sẵn)
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CA_BUNDLE.write_bytes(goc + b"\n" + b"".join(c.public_bytes(Encoding.PEM) for c in trung_gian))
+    log(f"🔐 Đã xác minh và bổ sung {len(trung_gian)} chứng chỉ trung gian cho {host}")
+    return str(CA_BUNDLE)
+
+
+def _xac_minh_chuoi(host, la, trung_gian, goc_pem):
+    """Xác minh đầy đủ (chữ ký, hạn dùng, tên miền) bằng bộ gốc tin cậy. Sai -> raise."""
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
+
+    try:
+        ten = x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        ten = x509.DNSName(host)
+    kho = Store(x509.load_pem_x509_certificates(goc_pem))
+    try:
+        return PolicyBuilder().store(kho).build_server_verifier(ten).verify(la, trung_gian)
+    except VerificationError as e:
+        raise RuntimeError(f"Chứng chỉ tải về KHÔNG hợp lệ, từ chối kết nối: {e}")
+
+
+# =========================================================
 # API WEB TRƯỜNG
 # =========================================================
 
@@ -123,16 +219,42 @@ class TluApi:
         self.password = password
         self.s = requests.Session()
         self.s.headers["Accept"] = "application/json"
+        self._da_sua_ssl = False
+        if CA_BUNDLE.exists():             # bộ chứng chỉ đã bổ sung từ lần chạy trước
+            self.s.verify = str(CA_BUNDLE)
+
+    def _sua_ssl(self):
+        """Gặp lỗi chứng chỉ: bổ sung chứng chỉ trung gian (chỉ làm 1 lần mỗi lần chạy)."""
+        if self._da_sua_ssl:
+            return False
+        self._da_sua_ssl = True
+        u = urlparse(BASE_URL)
+        try:
+            self.s.verify = tao_ca_bundle(u.hostname, u.port or 443)
+            self.s.close()                 # bỏ kết nối cũ để chắc chắn dùng bộ chứng chỉ mới
+            return True
+        except Exception as e:
+            log(f"⚠️ Không bổ sung được chứng chỉ: {ngan_gon(e)}")
+            return False
 
     def _goi(self, method, url, **kw):
         """Gọi API, tự thử lại khi lỗi mạng hoặc máy chủ trường lỗi (5xx)."""
         loi = None
-        for i in range(1, MAX_RETRY_API + 1):
+        i = 0
+        while i < MAX_RETRY_API:
+            i += 1
             try:
-                r = self.s.request(method, url, timeout=TIMEOUT_API, **kw)
+                # Truyền verify trực tiếp: requests có lỗi đã biết là biến môi trường
+                # REQUESTS_CA_BUNDLE ghi đè session.verify.
+                r = self.s.request(method, url, timeout=TIMEOUT_API, verify=self.s.verify, **kw)
                 if r.status_code < 500:
                     return r
                 loi = f"HTTP {r.status_code}"
+            except requests.exceptions.SSLError as e:
+                loi = e
+                if self._sua_ssl():
+                    i -= 1                 # thử lại ngay, không tính là 1 lần lỗi
+                    continue
             except requests.RequestException as e:
                 loi = e
             log(f"⚠️ API lỗi ({i}/{MAX_RETRY_API}): {ngan_gon(loi)}")
