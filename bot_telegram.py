@@ -1,1019 +1,508 @@
+"""
+Bot Telegram báo Lịch học / Lịch thi / Học phí từ cổng sinh viên TLU.
+
+Chạy bởi GitHub Actions mỗi sáng thứ Hai (xem .github/workflows/run_bot.yml).
+
+Biến môi trường cần có:
+    TELE_BOT_TOKEN, TELE_CHAT_ID, MSV, PASS_TRUONG
+Tùy chọn:
+    BOT_STATE_DIR   thư mục lưu trạng thái giữa các lần chạy (mặc định .bot_state)
+    TLU_BASE_URL    đổi địa chỉ web (dùng khi test)
+"""
+
+import hashlib
+import json
 import os
 import re
+import sys
 import time
-import requests
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+import requests
+from playwright.sync_api import TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 
 # =========================================================
 # CẤU HÌNH
 # =========================================================
 
-# Timeout cho thao tác UI
-TIMEOUT_CLICK = 12000
-TIMEOUT_TABLE_LOAD = 60000
-TIMEOUT_DROPDOWN = 30000
-TIMEOUT_CONTENT_CHANGE = 30000
-
-# Nghỉ rất ngắn để Angular bắt đầu xử lý sau click.
-# Không dùng sleep dài cố định.
-WAIT_AFTER_SELECT = 250
-
-# Retry
-MAX_RETRY_PAGE = 3
-MAX_RETRY_ACTION = 2
-MAX_RETRY_SCRAPE = 2
-
-RETRY_DELAY_PAGE = 3000       # milliseconds
-RETRY_DELAY_ACTION = 3        # seconds
-RETRY_DELAY_SCRAPE = 10       # seconds
+BASE_URL = os.environ.get("TLU_BASE_URL", "https://sinhvien1.tlu.edu.vn").rstrip("/")
+URL_LOGIN = f"{BASE_URL}/#/login"
+URL_LICH_HOC = f"{BASE_URL}/#/student/profile"
+URL_LICH_THI = f"{BASE_URL}/#/search_exam_room_student/listing"
+URL_HOC_PHI = f"{BASE_URL}/#/student_voucher_receive_pay/listing"
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
+# Timeout (ms)
+TIMEOUT_NAV = 60_000
+TIMEOUT_ELEMENT = 30_000
+TIMEOUT_CLICK = 12_000
+TIMEOUT_DOI_NOI_DUNG = 10_000   # chờ bảng đổi sau khi chọn dropdown
+TIMEOUT_HOC_PHI = 15_000        # chờ ô tiền nợ (không có = không nợ)
+
+# Retry
+MAX_RETRY_SCRAPE = 2            # thử lại cả phiên (mở browser + đăng nhập)
+MAX_RETRY_MUC = 2               # thử lại từng mục (lịch học / thi / học phí)
+MAX_RETRY_TELEGRAM = 3
+
+# Lịch thi: chỉ xét năm học mới nhất và năm liền trước.
+# Năm học cũ hơn không thể có lịch thi tương lai.
+SO_NAM_HOC_THI = 2
+LOAI_HOC_KY = ("Học kỳ chính", "Học kỳ hè")
+
+# Ảnh rõ hơn khi xem trên điện thoại.
+DEVICE_SCALE = 1.5
+
+STATE_DIR = Path(os.environ.get("BOT_STATE_DIR", ".bot_state"))
+STATE_FILE = STATE_DIR / "state.json"
+
+# Selector dùng chung
+SEL_DROPDOWN = ".page-content .ui-select-match"
+SEL_OPTION = ".ui-select-container.open .ui-select-choices-row"
+CSS_BANG_LICH_HOC = ".table-bordered"
+CSS_BANG_THI = ".page-content table"
+
+
+class LoiDangNhap(Exception):
+    """Sai tài khoản/mật khẩu: không retry để tránh bị khóa tài khoản."""
+
 
 # =========================================================
-# HÀM TIỆN ÍCH
+# TIỆN ÍCH CHUNG
 # =========================================================
 
-def log(msg):
+def log(msg=""):
     print(msg, flush=True)
 
 
-def cho_on_dinh(page, selector, timeout=TIMEOUT_TABLE_LOAD, state="visible"):
-    """
-    Chờ selector xuất hiện/hiển thị.
-
-    Trả về:
-        True  -> tìm thấy
-        False -> timeout
-
-    Hàm này KHÔNG đảm bảo dữ liệu bên trong selector đã đổi.
-    """
-    try:
-        page.wait_for_selector(
-            selector,
-            timeout=timeout,
-            state=state
-        )
-        return True
-
-    except PlaywrightTimeoutError:
-        log(
-            f"⚠️ Chờ '{selector}' quá "
-            f"{timeout / 1000:.0f}s mà chưa thấy."
-        )
-        return False
-
-
-def cho_danh_sach_on_dinh(page, selector, timeout=8000):
-    """
-    Chờ số lượng phần tử trong danh sách ổn định qua 2 lần đo liên tiếp.
-
-    Hữu ích với Angular ng-repeat vì option có thể render dần.
-    """
-    end_time = time.time() + timeout / 1000
-    last_count = -1
-    stable_count = 0
-
-    while time.time() < end_time:
-        try:
-            current_count = page.locator(selector).count()
-        except Exception:
-            current_count = 0
-
-        if current_count > 0 and current_count == last_count:
-            stable_count += 1
-            if stable_count >= 2:
-                return True
-        else:
-            stable_count = 0
-
-        last_count = current_count
-        page.wait_for_timeout(150)
-
-    return last_count > 0
-
-
-def cho_noi_dung_doi(
-    page,
-    selector,
-    noi_dung_cu,
-    timeout=TIMEOUT_CONTENT_CHANGE
-):
-    """
-    Chờ innerText của selector khác nội dung cũ.
-
-    Nếu dữ liệu mới giống hệt dữ liệu cũ thì có thể timeout.
-    Trường hợp đó trả False để code phía ngoài fallback.
-    """
-    if noi_dung_cu is None:
-        return True
-
-    try:
-        page.wait_for_function(
-            """
-            ({sel, old}) => {
-                const el = document.querySelector(sel);
-                return el && el.innerText !== old;
-            }
-            """,
-            arg={
-                "sel": selector,
-                "old": noi_dung_cu
-            },
-            timeout=timeout
-        )
-        return True
-
-    except PlaywrightTimeoutError:
-        log(
-            "⚠️ Nội dung chưa đổi sau khi chọn. "
-            "Có thể dữ liệu giống nhau hoặc server phản hồi chậm."
-        )
-        return False
-
-
-def goto_retry(page, url, retries=MAX_RETRY_PAGE):
-    """
-    Mở một trang với retry riêng.
-
-    Không dùng networkidle vì web Angular có thể tiếp tục gọi API nền.
-    """
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            log(
-                f"🌐 Mở trang "
-                f"({attempt}/{retries}): {url}"
-            )
-
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=60000
-            )
-
-            return True
-
-        except Exception as e:
-            last_error = e
-            log(
-                f"⚠️ Mở trang lỗi "
-                f"({attempt}/{retries}): {e}"
-            )
-
-            # Dừng navigation đang treo nếu có.
-            try:
-                page.evaluate("window.stop()")
-            except Exception:
-                pass
-
-            if attempt < retries:
-                page.wait_for_timeout(RETRY_DELAY_PAGE)
-
-    log(f"❌ Không mở được trang: {last_error}")
-    return False
-
-
-def retry_action(name, action, retries=MAX_RETRY_ACTION):
-    """
-    Retry riêng một chức năng như:
-        - lịch học
-        - lịch thi
-        - học phí
-
-    Nếu thử hết vẫn lỗi thì raise lỗi cuối cùng để tầng retry toàn bộ xử lý.
-    """
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            log(f"🔁 {name}: lần {attempt}/{retries}")
-            return action()
-
-        except Exception as e:
-            last_error = e
-            log(
-                f"⚠️ {name} lỗi "
-                f"({attempt}/{retries}): {e}"
-            )
-
-            if attempt < retries:
-                time.sleep(RETRY_DELAY_ACTION)
-
-    raise RuntimeError(
-        f"{name} thất bại sau {retries} lần: {last_error}"
+def tach_khoang_ngay(text):
+    """'Tuần 5 (24/08/2026 - 30/08/2026)' -> (date(2026,8,24), date(2026,8,30)) hoặc None."""
+    m = re.search(
+        r"\((\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\)",
+        text or "",
     )
-
-
-def tach_khoang_tuan(text):
-    """
-    Đọc chuỗi dạng:
-        Tuần ... (24/08/2026 - 30/08/2026)
-
-    Trả về:
-        (start_date, end_date)
-    hoặc:
-        None
-    """
-    match = re.search(
-        r"\((\d{1,2}/\d{1,2}/\d{4})"
-        r"\s*-\s*"
-        r"(\d{1,2}/\d{1,2}/\d{4})\)",
-        text or ""
-    )
-
-    if not match:
+    if not m:
         return None
-
     try:
-        start_str, end_str = match.groups()
-
-        start_date = datetime.strptime(
-            start_str,
-            "%d/%m/%Y"
-        ).date()
-
-        end_date = datetime.strptime(
-            end_str,
-            "%d/%m/%Y"
-        ).date()
-
-        return start_date, end_date
-
+        return tuple(datetime.strptime(s, "%d/%m/%Y").date() for s in m.groups())
     except ValueError:
         return None
 
 
-# =========================================================
-# DROPDOWN
-# =========================================================
+def chua_ngay(text, ngay):
+    khoang = tach_khoang_ngay(text)
+    return bool(khoang) and khoang[0] <= ngay <= khoang[1]
 
-def chon_dropdown(
-    page,
-    index,
-    wait_selector_after,
-    text_loc=None,
-    index_option=None
-):
-    """
-    Mở dropdown thứ `index`, chọn option rồi chờ dữ liệu cập nhật.
 
-    Có thể chọn bằng:
-        text_loc="Học kỳ chính"
-
-    hoặc:
-        index_option=0
-    """
-    try:
-        dropdowns = page.locator(
-            ".page-content .ui-select-match"
-        )
-
-        if dropdowns.count() <= index:
-            log(
-                f"⚠️ Không tồn tại dropdown #{index}."
-            )
-            return False
-
-        # Lưu nội dung cũ của vùng dữ liệu.
+def cac_ngay_trong(text):
+    """Mọi ngày dd/mm/yyyy hợp lệ có trong chuỗi."""
+    ket_qua = []
+    for s in re.findall(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text or ""):
         try:
-            old_content = page.locator(
-                wait_selector_after
-            ).first.inner_text()
-        except Exception:
-            old_content = None
+            ket_qua.append(datetime.strptime(s, "%d/%m/%Y").date())
+        except ValueError:
+            pass
+    return ket_qua
 
-        dropdown = dropdowns.nth(index)
-        dropdown.click(timeout=TIMEOUT_CLICK)
 
-        page.wait_for_timeout(WAIT_AFTER_SELECT)
+def hom_nay():
+    return datetime.now(VN_TZ).date()
 
-        option_selector = (
-            ".ui-select-container.open "
-            ".ui-select-choices-row"
-        )
 
-        if not cho_danh_sach_on_dinh(
-            page,
-            option_selector,
-            timeout=TIMEOUT_DROPDOWN
-        ):
-            log(
-                f"⚠️ Dropdown #{index} không load option."
-            )
+def ngan_gon(loi):
+    """Dòng đầu của thông báo lỗi (bỏ phần 'Call log' dài dòng của Playwright)."""
+    dong = str(loi).strip().splitlines()
+    return dong[0] if dong else type(loi).__name__
 
+
+def link_lan_chay():
+    """Link tới lần chạy GitHub Actions hiện tại (nếu có)."""
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if server and repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return ""
+
+
+# =========================================================
+# TIỆN ÍCH PLAYWRIGHT
+# =========================================================
+
+# Tìm phần tử ĐANG HIỂN THỊ đầu tiên khớp CSS (querySelector không hiểu :visible).
+_JS_TIM = "sel => [...document.querySelectorAll(sel)].find(e => e.getClientRects().length > 0)"
+
+# Đọc innerText của bảng đang hiển thị. Trả null khi chưa có bảng hoặc tbody đang
+# trống: Angular thường XÓA bảng rồi mới đổ dữ liệu mới, lúc trống không được tính
+# là "đã cập nhật".
+JS_DOC_TEXT = f"""sel => {{
+    const el = ({_JS_TIM})(sel);
+    if (!el) return null;
+    const tb = el.querySelector('tbody');
+    if (tb && !tb.querySelector('tr')) return null;
+    return el.innerText;
+}}"""
+
+JS_BANG_CO_MON = f"""sel => {{
+    const t = ({_JS_TIM})(sel);
+    if (!t) return null;
+    return [...t.querySelectorAll('tbody tr')].some(tr =>
+        [...tr.querySelectorAll('td')].slice(1).some(td => td.innerText.trim() !== '')
+    );
+}}"""
+
+
+def doc_text(page, css):
+    try:
+        return page.evaluate(JS_DOC_TEXT, css)
+    except Exception:
+        return None
+
+
+def cho_text_on_dinh(page, css, timeout=5_000, khoang=200):
+    """Chờ innerText của phần tử giống nhau ở 2 lần đo liên tiếp (bảng render xong)."""
+    het_gio = time.monotonic() + timeout / 1000
+    truoc = doc_text(page, css)
+    while time.monotonic() < het_gio:
+        page.wait_for_timeout(khoang)
+        sau = doc_text(page, css)
+        if sau is not None and sau == truoc:
+            return True
+        truoc = sau
+    return False
+
+
+class TheoDoiMang:
+    """Đếm request API (xhr/fetch) để biết Angular đã tải xong dữ liệu chưa."""
+
+    def __init__(self, page):
+        self.tong = 0
+        self.dang_cho = 0
+        page.on("request", self._bat_dau)
+        page.on("requestfinished", self._xong)
+        page.on("requestfailed", self._xong)
+
+    @staticmethod
+    def _la_api(req):
+        return req.resource_type in ("xhr", "fetch")
+
+    def _bat_dau(self, req):
+        if self._la_api(req):
+            self.tong += 1
+            self.dang_cho += 1
+
+    def _xong(self, req):
+        if self._la_api(req):
+            self.dang_cho = max(0, self.dang_cho - 1)
+
+
+_mang = None   # TheoDoiMang của page hiện tại
+
+
+def cho_bang_cap_nhat(page, css, noi_dung_cu, so_request_truoc):
+    """
+    Sau khi đổi dropdown, dừng chờ ngay khi:
+      - bảng đã có nội dung mới, hoặc
+      - request API đã xong (dữ liệu mới có thể giống hệt dữ liệu cũ), hoặc
+      - 1.5s mà không có request nào (lựa chọn không cần tải dữ liệu).
+    Không phải ngồi chờ hết timeout khi bảng không đổi như trước.
+    Sau đó chờ bảng render ổn định.
+    """
+    bat_dau = time.monotonic()
+    het_gio = bat_dau + TIMEOUT_DOI_NOI_DUNG / 1000
+    while time.monotonic() < het_gio:
+        text = doc_text(page, css)
+        if text is not None:
+            if text != noi_dung_cu:
+                break
+            if _mang is not None:
+                co_request = _mang.tong > so_request_truoc
+                if co_request and _mang.dang_cho == 0:
+                    break
+                if not co_request and time.monotonic() - bat_dau > 1.5:
+                    break
+        page.wait_for_timeout(100)
+    cho_text_on_dinh(page, css)
+
+
+def so_request():
+    return _mang.tong if _mang is not None else 0
+
+
+def cho_danh_sach_on_dinh(page, selector, timeout):
+    """Chờ số phần tử > 0 và không đổi qua 2 lần đo (ng-repeat render dần)."""
+    het_gio = time.monotonic() + timeout / 1000
+    truoc, lan_on_dinh = -1, 0
+    while time.monotonic() < het_gio:
+        so = page.locator(selector).count()
+        if so > 0 and so == truoc:
+            lan_on_dinh += 1
+            if lan_on_dinh >= 2:
+                return True
+        else:
+            lan_on_dinh = 0
+        truoc = so
+        page.wait_for_timeout(150)
+    return truoc > 0
+
+
+# Angular đổi trang bằng #hash: giao diện trang cũ còn nằm lại một lúc. Đánh dấu
+# các phần tử cũ trước khi chuyển, rồi chờ chúng biến mất để không đọc nhầm bảng/
+# dropdown của trang trước.
+JS_DANH_DAU_CU = """() => document
+    .querySelectorAll('.page-content table, .page-content .ui-select-match, .portlet-body')
+    .forEach(e => e.setAttribute('data-bot-cu', ''))"""
+JS_HET_TRANG_CU = "() => !document.querySelector('[data-bot-cu]')"
+
+
+def mo_trang(page, url, lan_thu=3):
+    for i in range(1, lan_thu + 1):
+        try:
             try:
-                page.keyboard.press("Escape")
+                page.evaluate(JS_DANH_DAU_CU)
             except Exception:
                 pass
+            page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_NAV)
+            try:
+                page.wait_for_function(JS_HET_TRANG_CU, timeout=10_000)
+            except PWTimeout:
+                pass   # web giữ nguyên khung cũ: vẫn tiếp tục như bình thường
+            return
+        except Exception as e:
+            log(f"⚠️ Mở trang lỗi ({i}/{lan_thu}): {e}")
+            if i < lan_thu:
+                page.wait_for_timeout(3_000)
+    raise RuntimeError(f"Không mở được {url}")
 
-            return False
 
-        options = page.locator(option_selector)
+def dong_dropdown(page):
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
 
-        if text_loc is not None:
-            opt = options.filter(
-                has_text=text_loc
-            ).first
 
-        elif index_option is not None:
-            opt = options.nth(index_option)
+def mo_dropdown(page, dropdown):
+    """Click mở dropdown, trả về locator các option."""
+    dropdown.click(timeout=TIMEOUT_CLICK)
+    if not cho_danh_sach_on_dinh(page, SEL_OPTION, TIMEOUT_ELEMENT):
+        dong_dropdown(page)
+        raise RuntimeError("Dropdown không load được danh sách lựa chọn.")
+    return page.locator(SEL_OPTION)
 
-        else:
-            log("⚠️ Không có text_loc hoặc index_option.")
-            page.keyboard.press("Escape")
-            return False
+
+def chon_dropdown(page, index, css_bang, text=None, vi_tri=None):
+    """
+    Chọn một option ở dropdown thứ `index` (theo text hoặc vị trí) rồi chờ bảng cập nhật.
+    Nếu option đó đang được chọn sẵn thì bỏ qua, không phải chờ bảng đổi.
+    Trả về True nếu bảng đang hiển thị đúng lựa chọn.
+    """
+    dropdowns = page.locator(SEL_DROPDOWN)
+    if dropdowns.count() <= index:
+        return False
+
+    dropdown = dropdowns.nth(index)
+    try:
+        dang_chon = dropdown.inner_text().strip()
+        cu = doc_text(page, css_bang)
+        options = mo_dropdown(page, dropdown)
+        opt = options.filter(has_text=text).first if text is not None else options.nth(vi_tri)
 
         if opt.count() == 0:
-            page.keyboard.press("Escape")
+            dong_dropdown(page)
             return False
 
-        try:
-            if not opt.is_visible():
-                page.keyboard.press("Escape")
-                return False
-        except Exception:
-            page.keyboard.press("Escape")
-            return False
+        if opt.inner_text().strip() == dang_chon:
+            dong_dropdown(page)
+            return True
 
+        truoc = so_request()
         opt.click(timeout=TIMEOUT_CLICK)
-
-        # Chờ vùng dữ liệu tồn tại.
-        if not cho_on_dinh(
-            page,
-            wait_selector_after,
-            timeout=TIMEOUT_TABLE_LOAD
-        ):
-            return False
-
-        # Nếu đã có dữ liệu cũ, chờ nội dung thay đổi.
-        # Nếu giống nhau thật thì fallback, không coi là lỗi chết.
-        if old_content is not None:
-            changed = cho_noi_dung_doi(
-                page,
-                wait_selector_after,
-                old_content,
-                timeout=TIMEOUT_CONTENT_CHANGE
-            )
-
-            if not changed:
-                page.wait_for_timeout(700)
-
-        return True
-
     except Exception as e:
-        log(
-            f"⚠️ Lỗi khi chọn dropdown #{index}: {e}"
-        )
-
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-
+        log(f"⚠️ Lỗi chọn dropdown #{index}: {e}")
+        dong_dropdown(page)
         return False
+
+    cho_bang_cap_nhat(page, css_bang, cu, truoc)
+    return True
+
+
+def chup(locator, path):
+    locator.screenshot(path=path, animations="disabled")
+    return path
+
+
+def chup_debug(page, ten):
+    path = f"debug_{ten}.png"
+    try:
+        page.screenshot(path=path, full_page=True)
+        return path
+    except Exception:
+        return None
 
 
 # =========================================================
 # ĐĂNG NHẬP
 # =========================================================
 
+# Câu báo lỗi thường gặp ở form đăng nhập. Chỉ tính câu XUẤT HIỆN SAU khi bấm
+# Đăng nhập, để chữ có sẵn trên trang không gây báo nhầm.
+JS_KET_QUA_DANG_NHAP = r"""before => {
+    if (!location.hash.includes('/login')) return 'ok';
+    const t = document.body.innerText.toLowerCase();
+    const m = t.match(/không đúng|không chính xác|sai mật khẩu|sai tài khoản|incorrect|invalid/);
+    return (m && !before.includes(m[0])) ? 'sai' : false;
+}"""
+
+
 def dang_nhap(page, msv, password):
-    log("🚀 BƯỚC 1: Đăng nhập hệ thống...")
-
-    url = "https://sinhvien1.tlu.edu.vn/#/login"
-
-    if not goto_retry(page, url):
-        raise RuntimeError(
-            "Không mở được trang đăng nhập."
-        )
-
-    if not cho_on_dinh(
-        page,
-        "#username",
-        timeout=TIMEOUT_TABLE_LOAD
-    ):
-        raise RuntimeError(
-            "Không thấy ô tài khoản."
-        )
-
+    log("🚀 Đăng nhập...")
+    mo_trang(page, URL_LOGIN)
+    page.wait_for_selector("#username", timeout=TIMEOUT_ELEMENT)
     page.fill("#username", msv)
     page.fill("#password", password)
 
-    page.click(
-        'button:has-text("Đăng nhập")',
-        timeout=TIMEOUT_CLICK
-    )
+    truoc = page.evaluate("() => document.body.innerText.toLowerCase()")
+    page.click('button:has-text("Đăng nhập")', timeout=TIMEOUT_CLICK)
 
-    # Không dùng networkidle.
-    # Chờ URL rời route /login.
     try:
-        page.wait_for_function(
-            """
-            () => !location.hash.includes('/login')
-            """,
-            timeout=60000
-        )
+        ket_qua = page.wait_for_function(
+            JS_KET_QUA_DANG_NHAP, arg=truoc, timeout=TIMEOUT_NAV
+        ).json_value()
+    except PWTimeout:
+        raise RuntimeError("Đăng nhập quá thời gian chờ (web trường chậm?).")
 
-    except PlaywrightTimeoutError:
-        raise RuntimeError(
-            "Đăng nhập timeout hoặc tài khoản/mật khẩu không đúng."
-        )
-
-    log("✅ Đăng nhập thành công!")
+    if ket_qua == "sai":
+        raise LoiDangNhap("Sai MSV hoặc mật khẩu.")
+    log("✅ Đăng nhập thành công")
 
 
 # =========================================================
 # LỊCH HỌC
 # =========================================================
 
-def tuan_co_lich_hoc(page):
-    """
-    Kiểm tra bảng lịch học có môn hay không.
-
-    Tối ưu bằng JavaScript trong browser thay vì gọi inner_text()
-    cho từng ô từ Python.
-    """
-    try:
-        tbody = page.locator(
-            ".table-bordered:visible tbody"
-        ).first
-
-        if tbody.count() == 0:
-            return False
-
-        return tbody.evaluate(
-            """
-            tbody => {
-                const rows = [
-                    ...tbody.querySelectorAll('tr')
-                ];
-
-                return rows.some(row => {
-                    const cells = [
-                        ...row.querySelectorAll('td')
-                    ].slice(1);
-
-                    return cells.some(
-                        cell => cell.innerText.trim().length > 0
-                    );
-                });
-            }
-            """
-        )
-
-    except Exception as e:
-        log(
-            f"⚠️ Lỗi khi kiểm tra bảng lịch học: {e}"
-        )
-
-        # Nếu lỗi thì coi như có lịch để tránh báo nhầm "được nghỉ".
-        return True
-
-
 def cao_lich_hoc(page):
     """
-    Chỉ xử lý ĐÚNG tuần chứa ngày hôm nay.
-
-    Quy tắc quan trọng:
-    - Tuyệt đối không dùng tuần mặc định nếu tuần mặc định là tuần sau/tuần trước.
-    - Nếu danh sách tuần không có tuần chứa hôm nay, coi tuần hiện tại là chưa có lịch học.
-    - Sau khi chọn tuần, xác minh lại dropdown thật sự đang ở đúng tuần hiện tại trước khi chụp.
-
-    Trả về:
-        (path_anh, None)          -> tuần hiện tại có lịch
-        (None, tin_nhan_nghi)     -> tuần hiện tại không có lịch
-
-    Lỗi tải trang/dropdown thật sự sẽ raise để retry_action chạy lại.
+    Chỉ xử lý ĐÚNG tuần chứa hôm nay (giờ VN).
+    Trả về {"anh": path} nếu tuần này có lịch, {"tin": "..."} nếu được nghỉ.
     """
-    log("📅 BƯỚC 2: Vào trang Lịch học...")
+    log("📅 Lịch học...")
+    mo_trang(page, URL_LICH_HOC)
 
-    url = (
-        "https://sinhvien1.tlu.edu.vn/"
-        "#/student/profile"
-    )
+    tab_bang = page.locator('a:has-text("Bảng")').first
+    tab_bang.wait_for(state="visible", timeout=TIMEOUT_ELEMENT)
+    tab_bang.click(timeout=TIMEOUT_CLICK)
 
-    if not goto_retry(page, url):
-        raise RuntimeError(
-            "Không mở được trang lịch học."
-        )
+    ngay = hom_nay()
+    dau_tuan = ngay - timedelta(days=ngay.weekday())
+    cuoi_tuan = dau_tuan + timedelta(days=6)
+    khoang = f"({dau_tuan:%d/%m} - {cuoi_tuan:%d/%m})"
+    nghi = {"tin": f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!"}
 
-    if not cho_on_dinh(
-        page,
-        'a:has-text("Bảng")',
-        timeout=TIMEOUT_TABLE_LOAD
-    ):
-        raise RuntimeError(
-            "Không thấy tab Bảng."
-        )
-
-    page.locator(
-        'a:has-text("Bảng")'
-    ).first.click(
-        timeout=TIMEOUT_CLICK
-    )
-
-    # -----------------------------------------------------
-    # Xác định TUẦN HIỆN TẠI theo giờ Việt Nam.
-    # Monday = 0 -> Sunday = 6.
-    # Ví dụ 28/08/2026 -> 24/08/2026 - 30/08/2026.
-    # -----------------------------------------------------
-    today = datetime.now(VN_TZ).date()
-    current_week_start = today - timedelta(days=today.weekday())
-    current_week_end = current_week_start + timedelta(days=6)
-
-    log(
-        "🕒 Ngày hiện tại theo giờ Việt Nam: "
-        f"{today.strftime('%d/%m/%Y')}"
-    )
-    log(
-        "📆 Tuần cần kiểm tra: "
-        f"{current_week_start.strftime('%d/%m/%Y')} - "
-        f"{current_week_end.strftime('%d/%m/%Y')}"
-    )
-
-    khoang = (
-        f" ({current_week_start.strftime('%d/%m')} - "
-        f"{current_week_end.strftime('%d/%m')})"
-    )
-
-    def bao_tuan_nghi():
-        log(
-            f"🎉 Tuần này{khoang} không có lịch học."
-        )
-        return (
-            None,
-            (
-                f"Tuần này{khoang} không có lịch học nào. "
-                "Nghỉ"
-            )
-        )
-
-    # -----------------------------------------------------
-    # Chờ dropdown tuần.
-    # -----------------------------------------------------
     dropdown_tuan = (
-        page.locator("label")
-        .filter(has_text="Tuần")
-        .locator("..")
-        .locator(".ui-select-match")
+        page.locator("label").filter(has_text="Tuần")
+        .locator("..").locator(".ui-select-match")
     )
+    dropdown_tuan.wait_for(state="visible", timeout=TIMEOUT_ELEMENT)
 
-    try:
-        dropdown_tuan.wait_for(
-            state="visible",
-            timeout=TIMEOUT_DROPDOWN
+    if chua_ngay(dropdown_tuan.inner_text(), ngay):
+        # Web đang mở sẵn đúng tuần này.
+        page.locator(f"{CSS_BANG_LICH_HOC}:visible").first.wait_for(timeout=TIMEOUT_ELEMENT)
+        cho_text_on_dinh(page, CSS_BANG_LICH_HOC)
+    else:
+        cu = doc_text(page, CSS_BANG_LICH_HOC)
+        options = mo_dropdown(page, dropdown_tuan)
+        # Lấy text mọi option trong 1 lần gọi thay vì đọc từng dòng.
+        vi_tri = next(
+            (i for i, t in enumerate(options.all_inner_texts()) if chua_ngay(t, ngay)),
+            None,
         )
-    except PlaywrightTimeoutError:
-        raise RuntimeError(
-            "Không load được dropdown Tuần."
-        )
+        if vi_tri is None:
+            # Danh sách tuần không có tuần này -> chưa có lịch. KHÔNG chụp tuần khác.
+            dong_dropdown(page)
+            log("ℹ️ Không có tuần chứa hôm nay trong danh sách.")
+            return nghi
 
-    # -----------------------------------------------------
-    # BƯỚC A: Kiểm tra tuần web đang hiển thị sẵn.
-    # Chỉ chấp nhận nếu ngày hôm nay thật sự nằm trong range đó.
-    # -----------------------------------------------------
-    try:
-        selected_text = dropdown_tuan.inner_text().strip()
-        selected_range = tach_khoang_tuan(selected_text)
-    except Exception:
-        selected_text = ""
-        selected_range = None
+        truoc = so_request()
+        options.nth(vi_tri).click(timeout=TIMEOUT_CLICK)
+        cho_bang_cap_nhat(page, CSS_BANG_LICH_HOC, cu, truoc)
 
-    if selected_range:
-        s, e = selected_range
+        # Xác minh lại trước khi chụp để không bao giờ gửi nhầm tuần.
+        sau = dropdown_tuan.inner_text()
+        if not chua_ngay(sau, ngay):
+            raise RuntimeError(f"Web không chuyển sang tuần hiện tại (đang: {sau.strip()}).")
 
-        if s <= today <= e:
-            log(
-                "✅ Web đang hiển thị đúng tuần hiện tại: "
-                f"{s.strftime('%d/%m')} - {e.strftime('%d/%m')}"
-            )
+    co_mon = page.evaluate(JS_BANG_CO_MON, CSS_BANG_LICH_HOC)
+    if co_mon is None:
+        raise RuntimeError("Không thấy bảng lịch học.")
+    if not co_mon:
+        return nghi
 
-            if not cho_on_dinh(
-                page,
-                ".table-bordered:visible",
-                timeout=TIMEOUT_TABLE_LOAD
-            ):
-                raise RuntimeError(
-                    "Không load được bảng lịch học tuần hiện tại."
-                )
-
-            if not tuan_co_lich_hoc(page):
-                return bao_tuan_nghi()
-
-            path = "anh_lich_hoc.png"
-            page.locator(
-                ".table-bordered:visible"
-            ).first.screenshot(path=path)
-
-            log("✅ Đã chụp đúng lịch học tuần hiện tại!")
-            return path, None
-
-        log(
-            "⚠️ Web đang mặc định ở tuần khác: "
-            f"{s.strftime('%d/%m')} - {e.strftime('%d/%m')}. "
-            "Sẽ KHÔNG dùng bảng này."
-        )
-
-    # -----------------------------------------------------
-    # BƯỚC B: Web không ở đúng tuần -> mở dropdown và tìm
-    # OPTION có khoảng ngày chứa chính xác ngày hôm nay.
-    # -----------------------------------------------------
-    try:
-        dropdown_tuan.click(timeout=TIMEOUT_CLICK)
-
-        option_selector = (
-            ".ui-select-container.open "
-            ".ui-select-choices-row"
-        )
-
-        if not cho_danh_sach_on_dinh(
-            page,
-            option_selector,
-            timeout=TIMEOUT_DROPDOWN
-        ):
-            raise RuntimeError(
-                "Danh sách tuần không load."
-            )
-
-        rows = page.locator(option_selector)
-        row_tuan_hien_tai = None
-        range_tuan_hien_tai = None
-
-        for i in range(rows.count()):
-            row = rows.nth(i)
-
-            try:
-                text = row.inner_text().strip()
-            except Exception:
-                continue
-
-            week_range = tach_khoang_tuan(text)
-
-            if not week_range:
-                continue
-
-            start_date, end_date = week_range
-
-            if start_date <= today <= end_date:
-                row_tuan_hien_tai = row
-                range_tuan_hien_tai = (
-                    start_date,
-                    end_date
-                )
-                break
-
-        # -------------------------------------------------
-        # Không hề có option chứa hôm nay.
-        # Ví dụ hôm nay 28/08 nhưng option đầu tiên là
-        # 31/08 - 06/09 => tuần 24/08 - 30/08 chưa có lịch.
-        # TUYỆT ĐỐI KHÔNG chụp tuần 31/08.
-        # -------------------------------------------------
-        if row_tuan_hien_tai is None:
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-
-            log(
-                "✅ Dropdown không có tuần chứa ngày hôm nay. "
-                "Coi tuần hiện tại là không có lịch học."
-            )
-            return bao_tuan_nghi()
-
-        # Lưu nội dung bảng cũ trước khi đổi tuần.
-        try:
-            old_content = page.locator(
-                ".table-bordered:visible"
-            ).first.inner_text()
-        except Exception:
-            old_content = None
-
-        start_date, end_date = range_tuan_hien_tai
-
-        log(
-            "👉 Chọn đúng tuần hiện tại: "
-            f"{start_date.strftime('%d/%m/%Y')} - "
-            f"{end_date.strftime('%d/%m/%Y')}"
-        )
-
-        row_tuan_hien_tai.click(
-            timeout=TIMEOUT_CLICK
-        )
-
-        # Đợi UI có thời gian bắt đầu cập nhật.
-        page.wait_for_timeout(WAIT_AFTER_SELECT)
-
-        # Chờ bảng tồn tại.
-        if not cho_on_dinh(
-            page,
-            ".table-bordered:visible",
-            timeout=TIMEOUT_TABLE_LOAD
-        ):
-            raise RuntimeError(
-                "Không load được bảng sau khi chọn tuần hiện tại."
-            )
-
-        # Chờ bảng đổi nếu trước đó có dữ liệu tuần khác.
-        if old_content is not None:
-            changed = cho_noi_dung_doi(
-                page,
-                ".table-bordered",
-                old_content,
-                timeout=TIMEOUT_CONTENT_CHANGE
-            )
-
-            # Nội dung có thể giống nhau, nên đây không phải điều kiện duy nhất.
-            if not changed:
-                page.wait_for_timeout(700)
-
-        # -------------------------------------------------
-        # BƯỚC C QUAN TRỌNG:
-        # Xác minh dropdown SAU CLICK đang đúng tuần hiện tại.
-        # Nếu vẫn là 31/08 hoặc tuần khác -> không chụp nhầm.
-        # -------------------------------------------------
-        try:
-            selected_after = dropdown_tuan.inner_text().strip()
-            selected_after_range = tach_khoang_tuan(selected_after)
-        except Exception:
-            selected_after = ""
-            selected_after_range = None
-
-        if not selected_after_range:
-            raise RuntimeError(
-                "Không xác minh được tuần sau khi chọn."
-            )
-
-        selected_start, selected_end = selected_after_range
-
-        if not (
-            selected_start <= today <= selected_end
-        ):
-            raise RuntimeError(
-                "Web không chuyển sang đúng tuần hiện tại; "
-                f"đang hiển thị {selected_start.strftime('%d/%m')} - "
-                f"{selected_end.strftime('%d/%m')}. "
-                "Hủy chụp để tránh gửi nhầm tuần."
-            )
-
-        log(
-            "✅ Đã xác minh dropdown đang ở đúng tuần: "
-            f"{selected_start.strftime('%d/%m')} - "
-            f"{selected_end.strftime('%d/%m')}"
-        )
-
-    except RuntimeError:
-        raise
-
-    except Exception as e:
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            f"Lỗi khi chọn tuần hiện tại: {e}"
-        )
-
-    # -----------------------------------------------------
-    # BƯỚC D: Chỉ tới đây khi đã xác minh chắc chắn
-    # bảng đang là tuần chứa hôm nay.
-    # -----------------------------------------------------
-    if not tuan_co_lich_hoc(page):
-        return bao_tuan_nghi()
-
-    path = "anh_lich_hoc.png"
-
-    page.locator(
-        ".table-bordered:visible"
-    ).first.screenshot(
-        path=path
-    )
-
-    log("✅ Đã chụp đúng lịch học tuần hiện tại!")
-
-    return path, None
+    path = chup(page.locator(f"{CSS_BANG_LICH_HOC}:visible").first, "anh_lich_hoc.png")
+    log("✅ Đã chụp lịch học tuần này")
+    return {"anh": path}
 
 
 # =========================================================
 # LỊCH THI
 # =========================================================
 
-def kiem_tra_co_lich_tuong_lai(page, hom_nay):
-    """
-    Kiểm tra bảng hiện tại có ngày thi >= hôm nay hay không.
-
-    hom_nay là datetime.date.
-    """
+def dong_thi_sap_toi(page, ngay):
+    """Các dòng trong bảng thi có ngày >= hôm nay."""
     try:
-        rows = page.locator(
-            ".page-content table tbody tr"
-        ).all_inner_texts()
-
-        if not rows:
-            return False
-
-        chu_trong_bang = "\n".join(rows)
-
-        if (
-            "Không tìm thấy" in chu_trong_bang
-            or "Không có" in chu_trong_bang
-        ):
-            return False
-
-        cac_ngay_thi = re.findall(
-            r"(\d{1,2}/\d{1,2}/\d{4})",
-            chu_trong_bang
-        )
-
-        for ngay_str in cac_ngay_thi:
-            try:
-                ngay_thi = datetime.strptime(
-                    ngay_str,
-                    "%d/%m/%Y"
-                ).date()
-
-                if ngay_thi >= hom_nay:
-                    log(
-                        "👉 Có môn thi sắp tới: "
-                        f"{ngay_str}"
-                    )
-                    return True
-
-            except ValueError:
-                pass
-
-        log(
-            "⚠️ Bảng hiện tại chỉ có lịch thi cũ."
-        )
-
-    except Exception as e:
-        log(
-            f"⚠️ Lỗi khi kiểm tra bảng lịch thi: {e}"
-        )
-
-    return False
+        rows = page.locator(f"{CSS_BANG_THI} tbody tr").all_inner_texts()
+    except Exception:
+        return []
+    return [r.strip() for r in rows if any(d >= ngay for d in cac_ngay_trong(r))]
 
 
 def cao_lich_thi(page):
-    log("📝 BƯỚC 3: Kiểm tra Lịch thi...")
+    """Trả về {"anh": path, "hash": ...} nếu có lịch thi sắp tới, ngược lại None."""
+    log("📝 Lịch thi...")
+    mo_trang(page, URL_LICH_THI)
+    page.wait_for_selector(".page-content", timeout=TIMEOUT_ELEMENT)
+    cho_text_on_dinh(page, CSS_BANG_THI)
 
-    url = (
-        "https://sinhvien1.tlu.edu.vn/"
-        "#/search_exam_room_student/listing"
-    )
+    ngay = hom_nay()
+    dong = dong_thi_sap_toi(page, ngay)
 
-    if not goto_retry(page, url):
-        raise RuntimeError(
-            "Không mở được trang lịch thi."
-        )
+    if not dong:
+        try:
+            page.locator(SEL_DROPDOWN).first.wait_for(timeout=TIMEOUT_ELEMENT)
+        except PWTimeout:
+            raise RuntimeError("Trang lịch thi không load được ô chọn.")
 
-    if not cho_on_dinh(
-        page,
-        ".page-content",
-        timeout=TIMEOUT_TABLE_LOAD
-    ):
-        raise RuntimeError(
-            "Trang lịch thi không load."
-        )
+        if page.locator(SEL_DROPDOWN).count() < 2:
+            raise RuntimeError("Trang lịch thi thiếu ô chọn Năm học/Học kỳ.")
 
-    hom_nay = datetime.now(VN_TZ).date()
+        for i in range(SO_NAM_HOC_THI):
+            if dong or not chon_dropdown(page, 0, CSS_BANG_THI, vi_tri=i):
+                break
+            for loai in LOAI_HOC_KY:
+                if not chon_dropdown(page, 1, CSS_BANG_THI, text=loai):
+                    continue
+                if page.locator(SEL_DROPDOWN).count() >= 3:
+                    chon_dropdown(page, 2, CSS_BANG_THI, vi_tri=0)   # đợt thi mới nhất
+                dong = dong_thi_sap_toi(page, ngay)
+                if dong:
+                    break
 
-    # Kiểm tra dữ liệu mặc định trước.
-    co_lich_thi = kiem_tra_co_lich_tuong_lai(
-        page,
-        hom_nay
-    )
-
-    # Nếu mặc định chưa có thì duyệt các dropdown.
-    if not co_lich_thi:
-
-        if cho_on_dinh(
-            page,
-            ".page-content .ui-select-match",
-            timeout=TIMEOUT_DROPDOWN
-        ):
-            dropdowns = page.locator(
-                ".page-content .ui-select-match"
-            )
-
-            so_luong_o = dropdowns.count()
-
-            log(
-                f"👉 Tìm thấy {so_luong_o} ô chọn."
-            )
-
-            if so_luong_o >= 2:
-
-                # Lùi tối đa 4 năm học.
-                for i in range(4):
-
-                    if co_lich_thi:
-                        break
-
-                    log(
-                        f"🔍 Đang kiểm tra Năm học "
-                        f"thứ {i + 1}..."
-                    )
-
-                    if not chon_dropdown(
-                        page,
-                        0,
-                        ".page-content table",
-                        index_option=i
-                    ):
-                        break
-
-                    for loai_ten in [
-                        "Học kỳ chính",
-                        "Học kỳ hè"
-                    ]:
-                        if co_lich_thi:
-                            break
-
-                        log(
-                            "   👉 Kiểm tra: "
-                            f"'{loai_ten}'"
-                        )
-
-                        if not chon_dropdown(
-                            page,
-                            1,
-                            ".page-content table",
-                            text_loc=loai_ten
-                        ):
-                            continue
-
-                        dropdowns = page.locator(
-                            ".page-content .ui-select-match"
-                        )
-
-                        # Nếu có dropdown Đợt thi:
-                        if dropdowns.count() >= 3:
-                            log(
-                                "   👉 Chọn Đợt thi mới nhất..."
-                            )
-
-                            chon_dropdown(
-                                page,
-                                2,
-                                ".page-content table",
-                                index_option=0
-                            )
-
-                        if kiem_tra_co_lich_tuong_lai(
-                            page,
-                            hom_nay
-                        ):
-                            co_lich_thi = True
-
-                            log(
-                                "✅ Đã tìm thấy lịch thi sắp tới!"
-                            )
-
-                            break
-
-            else:
-                log(
-                    "⚠️ Không đủ dropdown, "
-                    "web có thể chưa load xong."
-                )
-
-    if not co_lich_thi:
-        log(
-            "✅ Không có lịch thi sắp tới."
-        )
+    if not dong:
+        log("✅ Không có lịch thi sắp tới")
         return None
 
-    log("🚨 Đang chụp ảnh Lịch thi...")
+    vung = page.locator(".portlet-body:visible").last
+    if vung.count() == 0:
+        vung = page.locator(".page-content").first
+    path = chup(vung, "anh_lich_thi.png")
 
-    vung_chup = page.locator(
-        ".portlet-body"
-    ).last
-
-    try:
-        if not vung_chup.is_visible():
-            vung_chup = page.locator(
-                ".page-content"
-            ).first
-    except Exception:
-        vung_chup = page.locator(
-            ".page-content"
-        ).first
-
-    path = "anh_lich_thi.png"
-
-    vung_chup.screenshot(
-        path=path
-    )
-
-    log("✅ Đã chụp xong lịch thi!")
-
-    return path
+    dau_van_tay = hashlib.sha256("\n".join(sorted(dong)).encode()).hexdigest()
+    log(f"✅ Có {len(dong)} môn thi sắp tới, đã chụp")
+    return {"anh": path, "hash": dau_van_tay}
 
 
 # =========================================================
@@ -1021,469 +510,254 @@ def cao_lich_thi(page):
 # =========================================================
 
 def kiem_tra_hoc_phi(page):
-    log("💰 BƯỚC 4: Tra cứu Học phí...")
+    """Trả về {"anh": path, "tin": ...} nếu còn nợ, ngược lại None."""
+    log("💰 Học phí...")
+    mo_trang(page, URL_HOC_PHI)
+    page.wait_for_selector(".page-content", timeout=TIMEOUT_ELEMENT)
 
-    url = (
-        "https://sinhvien1.tlu.edu.vn/"
-        "#/student_voucher_receive_pay/listing"
-    )
-
-    if not goto_retry(page, url):
-        raise RuntimeError(
-            "Không mở được trang học phí."
-        )
-
-    if not cho_on_dinh(
-        page,
-        ".page-content",
-        timeout=TIMEOUT_TABLE_LOAD
-    ):
-        raise RuntimeError(
-            "Trang học phí không load."
-        )
-
-    # strong.font-red có thể không tồn tại khi không nợ.
-    found = cho_on_dinh(
-        page,
-        "strong.font-red",
-        timeout=15000
-    )
-
-    if not found:
-        log(
-            "✅ Không thấy khoản nợ hiển thị. "
-            "Có thể đã đóng đủ tiền."
-        )
-        return None, ""
-
+    o_tien = page.locator("strong.font-red").first
     try:
-        chuoi_tien_no = (
-            page.locator("strong.font-red")
-            .first
-            .inner_text()
-            .strip()
-        )
+        o_tien.wait_for(state="visible", timeout=TIMEOUT_HOC_PHI)
+    except PWTimeout:
+        log("✅ Không thấy khoản nợ")
+        return None
 
-        # Chỉ giữ chữ số để tránh lỗi dấu . , hoặc ký hiệu tiền.
-        digits = re.sub(
-            r"[^\d]",
-            "",
-            chuoi_tien_no
-        )
+    chuoi = o_tien.inner_text().strip()
+    so = re.sub(r"\D", "", chuoi)
+    if not so:
+        raise RuntimeError(f"Không đọc được số tiền nợ: {chuoi!r}")
+    if int(so) <= 0:
+        log("✅ Không còn nợ")
+        return None
 
-        if not digits:
-            raise ValueError(
-                f"Không có số hợp lệ: {chuoi_tien_no}"
-            )
+    vung = page.locator(".portlet-body:visible").first
+    if vung.count() == 0:
+        vung = page.locator(".page-content").first
+    path = chup(vung, "anh_hoc_phi.png")
 
-        so_tien = int(digits)
-
-    except Exception as e:
-        raise RuntimeError(
-            f"Không đọc được số tiền nợ: {e}"
-        )
-
-    if so_tien <= 0:
-        log("✅ Số nợ = 0. Đã đóng đủ tiền!")
-        return None, ""
-
-    log(
-        f"🚨 CẢNH BÁO: Đang nợ "
-        f"{chuoi_tien_no} VNĐ!"
-    )
-
-    path = "anh_hoc_phi.png"
-
-    vung_chup = page.locator(
-        ".portlet-body"
-    ).first
-
-    if vung_chup.count() == 0:
-        vung_chup = page.locator(
-            ".page-content"
-        ).first
-
-    vung_chup.screenshot(
-        path=path
-    )
-
-    return (
-        path,
-        (
-            f"🚨 CẢNH BÁO HỌC PHÍ: "
-            f"{chuoi_tien_no} VNĐ"
-        )
-    )
+    # Không in số tiền ra log: log GitHub Actions của repo public ai cũng xem được.
+    log("🚨 Còn khoản học phí chưa đóng, đã chụp")
+    return {"anh": path, "tin": f"🚨 CẢNH BÁO HỌC PHÍ: {chuoi} VNĐ"}
 
 
 # =========================================================
-# PLAYWRIGHT - MỘT LẦN CÀO
+# CÀO DỮ LIỆU
 # =========================================================
 
-def scrape_data_once(msv, password):
-    ket_qua = {
-        "anh_lich_hoc": None,
-        "tin_nhan_lich_hoc": "",
-        "anh_lich_thi": None,
-        "anh_hoc_phi": None,
-        "tin_nhan_hoc_phi": ""
-    }
+CAC_MUC = (
+    ("lich_hoc", "Lịch học", cao_lich_hoc),
+    ("lich_thi", "Lịch thi", cao_lich_thi),
+    ("hoc_phi", "Học phí", kiem_tra_hoc_phi),
+)
+
+
+def chay_muc(page, khoa, ten, ham):
+    """
+    Chạy một mục có retry. Mỗi lần thử lại bắt đầu từ trang trắng để Angular load mới
+    hoàn toàn (goto cùng URL chỉ khác #hash thì trình duyệt KHÔNG tải lại trang).
+    """
+    for i in range(1, MAX_RETRY_MUC + 1):
+        try:
+            if i > 1:
+                page.goto("about:blank")
+            return ham(page)
+        except Exception as e:
+            log(f"⚠️ {ten} lỗi ({i}/{MAX_RETRY_MUC}): {e}")
+            loi = e
+    raise RuntimeError(f"{ten}: {ngan_gon(loi)}") from loi
+
+
+def scrape_mot_lan(msv, password):
+    global _mang
+    ket_qua = {"loi": []}
 
     with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1920,
-                "height": 1080
-            },
-            locale="vi-VN",
-            timezone_id="Asia/Ho_Chi_Minh"
-        )
-
-        page = context.new_page()
-
-        page.set_default_navigation_timeout(
-            60000
-        )
-
-        page.set_default_timeout(
-            30000
-        )
-
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
         try:
-            # ---------------------------------------------
-            # LOGIN
-            # ---------------------------------------------
-            dang_nhap(
-                page,
-                msv,
-                password
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                device_scale_factor=DEVICE_SCALE,
+                locale="vi-VN",
+                timezone_id="Asia/Ho_Chi_Minh",
             )
+            page = context.new_page()
+            _mang = TheoDoiMang(page)
+            page.set_default_timeout(TIMEOUT_ELEMENT)
+            page.set_default_navigation_timeout(TIMEOUT_NAV)
 
-            # ---------------------------------------------
-            # LỊCH HỌC
-            # ---------------------------------------------
-            lh_result = retry_action(
-                "Lịch học",
-                lambda: cao_lich_hoc(page)
-            )
+            try:
+                dang_nhap(page, msv, password)
+            except Exception:
+                chup_debug(page, "dang_nhap")
+                raise
 
-            if lh_result:
-                anh_lh, msg_lh = lh_result
-
-                ket_qua[
-                    "anh_lich_hoc"
-                ] = anh_lh
-
-                ket_qua[
-                    "tin_nhan_lich_hoc"
-                ] = msg_lh or ""
-
-            # ---------------------------------------------
-            # LỊCH THI
-            # ---------------------------------------------
-            ket_qua[
-                "anh_lich_thi"
-            ] = retry_action(
-                "Lịch thi",
-                lambda: cao_lich_thi(page)
-            )
-
-            # ---------------------------------------------
-            # HỌC PHÍ
-            # ---------------------------------------------
-            hp_result = retry_action(
-                "Học phí",
-                lambda: kiem_tra_hoc_phi(page)
-            )
-
-            if hp_result:
-                anh_hp, msg_hp = hp_result
-
-                ket_qua[
-                    "anh_hoc_phi"
-                ] = anh_hp
-
-                ket_qua[
-                    "tin_nhan_hoc_phi"
-                ] = msg_hp or ""
-
+            # Mỗi mục độc lập: một mục hỏng không làm mất kết quả của mục khác,
+            # cũng không phải đăng nhập lại từ đầu.
+            for khoa, ten, ham in CAC_MUC:
+                try:
+                    ket_qua[khoa] = chay_muc(page, khoa, ten, ham)
+                except Exception as e:
+                    ket_qua["loi"].append((str(e), chup_debug(page, khoa)))
+                    dong_dropdown(page)
         finally:
             browser.close()
 
     return ket_qua
 
 
-# =========================================================
-# RETRY TOÀN BỘ
-# =========================================================
-
-def scrape_data():
-    msv = os.environ.get("MSV")
-    password = os.environ.get("PASS_TRUONG")
-
-    if not msv or not password:
-        log(
-            "❌ Lỗi: Không tìm thấy "
-            "MSV hoặc PASS_TRUONG!"
-        )
-        return None
-
-    last_error = None
-
-    for attempt in range(
-        1,
-        MAX_RETRY_SCRAPE + 1
-    ):
+def scrape_data(msv, password):
+    """Retry cả phiên chỉ khi lỗi ở mức trình duyệt/đăng nhập. Sai mật khẩu thì dừng ngay."""
+    loi = None
+    for i in range(1, MAX_RETRY_SCRAPE + 1):
+        log(f"\n===== PHIÊN {i}/{MAX_RETRY_SCRAPE} =====")
         try:
-            log("")
-            log(
-                "======================================"
-            )
-            log(
-                f"===== LẦN THỬ TOÀN BỘ "
-                f"{attempt}/{MAX_RETRY_SCRAPE} ====="
-            )
-            log(
-                "======================================"
-            )
-
-            return scrape_data_once(
-                msv,
-                password
-            )
-
+            return scrape_mot_lan(msv, password)
+        except LoiDangNhap:
+            raise
         except Exception as e:
-            last_error = e
+            loi = e
+            log(f"❌ Phiên {i} lỗi: {e}")
+            if i < MAX_RETRY_SCRAPE:
+                time.sleep(10)
+    raise RuntimeError(f"Thử {MAX_RETRY_SCRAPE} phiên đều lỗi: {ngan_gon(loi)}")
 
-            log(
-                f"❌ LỖI TOÀN BỘ "
-                f"(lần {attempt}): {e}"
-            )
 
-            if attempt < MAX_RETRY_SCRAPE:
-                log(
-                    f"⏳ Thử lại toàn bộ sau "
-                    f"{RETRY_DELAY_SCRAPE}s..."
-                )
+# =========================================================
+# TRẠNG THÁI GIỮA CÁC LẦN CHẠY
+# =========================================================
 
-                time.sleep(
-                    RETRY_DELAY_SCRAPE
-                )
+def doc_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
-    log(
-        f"❌ Đã thử "
-        f"{MAX_RETRY_SCRAPE} lần "
-        f"đều thất bại: {last_error}"
-    )
 
-    return None
+def ghi_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # =========================================================
 # TELEGRAM
 # =========================================================
 
-def send_telegram_photo(
-    photo_path,
-    caption,
-    bot_token,
-    chat_id
-):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{bot_token}/sendPhoto"
-    )
+class Telegram:
+    def __init__(self, token, chat_id):
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+        self.session = requests.Session()
 
-    try:
-        if not os.path.exists(photo_path):
-            log(
-                f"❌ Không tìm thấy ảnh: "
-                f"{photo_path}"
-            )
+    def _goi(self, method, data, files=None):
+        data = {"chat_id": self.chat_id, **data}
+        for i in range(1, MAX_RETRY_TELEGRAM + 1):
+            cho = 3 * i
+            try:
+                r = self.session.post(f"{self.base}/{method}", data=data, files=files, timeout=30)
+                if r.ok:
+                    return True
+                if r.status_code == 429:
+                    try:
+                        cho = int(r.json()["parameters"]["retry_after"]) + 1
+                    except Exception:
+                        pass
+                elif r.status_code < 500:
+                    # Lỗi do request (chat_id sai, ảnh quá lớn...): thử lại cũng vô ích.
+                    log(f"❌ Telegram {method} lỗi {r.status_code}: {r.text}")
+                    return False
+                log(f"⚠️ Telegram {r.status_code}, thử lại sau {cho}s")
+            except requests.RequestException as e:
+                log(f"⚠️ Lỗi mạng Telegram ({i}/{MAX_RETRY_TELEGRAM}): {e}")
+            if i < MAX_RETRY_TELEGRAM:
+                time.sleep(cho)
+        log(f"❌ Gửi Telegram {method} thất bại")
+        return False
+
+    def tin(self, text):
+        return self._goi("sendMessage", {"text": text[:4096]})
+
+    def anh(self, path, caption=""):
+        try:
+            noi_dung = Path(path).read_bytes()
+        except OSError as e:
+            log(f"❌ Không đọc được ảnh {path}: {e}")
             return False
-
-        with open(
-            photo_path,
-            "rb"
-        ) as photo:
-
-            payload = {
-                "chat_id": chat_id,
-                "caption": caption
-            }
-
-            files = {
-                "photo": photo
-            }
-
-            response = requests.post(
-                url,
-                data=payload,
-                files=files,
-                timeout=30
-            )
-
-        if response.ok:
-            log(
-                f"🎉 Đã gửi ảnh: "
-                f"{caption[:30]}..."
-            )
-            return True
-
-        log(
-            f"❌ Telegram lỗi "
-            f"{response.status_code}: "
-            f"{response.text}"
+        return self._goi(
+            "sendPhoto",
+            {"caption": caption[:1024]},
+            files={"photo": (Path(path).name, noi_dung, "image/png")},
         )
-
-    except requests.RequestException as e:
-        log(
-            f"❌ Lỗi kết nối Telegram: {e}"
-        )
-
-    except Exception as e:
-        log(
-            f"❌ Lỗi khi gửi ảnh Telegram: {e}"
-        )
-
-    return False
-
-
-def send_telegram_message(
-    text,
-    bot_token,
-    chat_id
-):
-    """
-    Gửi tin nhắn văn bản thuần.
-    """
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{bot_token}/sendMessage"
-    )
-
-    try:
-        payload = {
-            "chat_id": chat_id,
-            "text": text
-        }
-
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=30
-        )
-
-        if response.ok:
-            log(
-                f"🎉 Đã gửi tin nhắn: "
-                f"{text[:30]}..."
-            )
-            return True
-
-        log(
-            f"❌ Telegram lỗi "
-            f"{response.status_code}: "
-            f"{response.text}"
-        )
-
-    except requests.RequestException as e:
-        log(
-            f"❌ Lỗi kết nối Telegram: {e}"
-        )
-
-    except Exception as e:
-        log(
-            f"❌ Lỗi khi gửi tin nhắn Telegram: {e}"
-        )
-
-    return False
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
+def main():
+    token = os.environ.get("TELE_BOT_TOKEN")
+    chat_id = os.environ.get("TELE_CHAT_ID")
+    if not token or not chat_id:
+        log("❌ Thiếu TELE_BOT_TOKEN hoặc TELE_CHAT_ID")
+        return 1
+
+    tg = Telegram(token, chat_id)
+    link = link_lan_chay()
+    duoi = f"\nXem log: {link}" if link else ""
+
+    msv = os.environ.get("MSV")
+    password = os.environ.get("PASS_TRUONG")
+    if not msv or not password:
+        tg.tin("❌ Bot lịch học: thiếu secret MSV hoặc PASS_TRUONG." + duoi)
+        return 1
+
+    try:
+        kq = scrape_data(msv, password)
+    except Exception as e:
+        if isinstance(e, LoiDangNhap):
+            tg.tin(f"❌ Bot lịch học: {e} Hãy cập nhật secret PASS_TRUONG.")
+        else:
+            tg.tin(f"❌ Bot lịch học không lấy được dữ liệu tuần này.\n{ngan_gon(e)}{duoi}")
+        if Path("debug_dang_nhap.png").exists():
+            tg.anh("debug_dang_nhap.png", "Ảnh màn hình lúc lỗi")
+        return 1
+
+    # ---- Lịch học
+    lh = kq.get("lich_hoc")
+    if lh and lh.get("anh"):
+        tg.anh(lh["anh"], "📌 Lịch học tuần này")
+    elif lh and lh.get("tin"):
+        tg.tin(lh["tin"])
+
+    # ---- Lịch thi (báo rõ là mới hay chỉ nhắc lại)
+    state = doc_state()
+    lt = kq.get("lich_thi")
+    if lt:
+        moi = lt["hash"] != state.get("lich_thi_hash")
+        caption = "🚨 CÓ LỊCH THI MỚI" if moi else "📝 Nhắc lịch thi sắp tới (không đổi)"
+        if tg.anh(lt["anh"], caption):
+            state["lich_thi_hash"] = lt["hash"]
+    elif "lich_thi" in kq:
+        # Cào thành công và không còn lịch thi -> lần sau có lịch sẽ báo là mới.
+        state.pop("lich_thi_hash", None)
+    ghi_state(state)
+
+    # ---- Học phí
+    hp = kq.get("hoc_phi")
+    if hp:
+        tg.anh(hp["anh"], hp["tin"])
+
+    # ---- Lỗi từng mục: báo kèm ảnh màn hình qua Telegram (riêng tư),
+    #      không upload lên GitHub vì repo public ai cũng tải được.
+    if kq["loi"]:
+        tg.tin("⚠️ Một số mục bị lỗi:\n" + "\n".join(f"• {m}" for m, _ in kq["loi"]) + duoi)
+        for m, anh in kq["loi"]:
+            if anh:
+                tg.anh(anh, f"Ảnh lúc lỗi: {m[:200]}")
+        return 1
+
+    log("\n🏁 Xong!")
+    return 0
+
+
 if __name__ == "__main__":
-
-    bot_token = os.environ.get(
-        "TELE_BOT_TOKEN"
-    )
-
-    chat_id = os.environ.get(
-        "TELE_CHAT_ID"
-    )
-
-    if not bot_token or not chat_id:
-        log(
-            "❌ Lỗi: Không tìm thấy "
-            "TELE_BOT_TOKEN hoặc TELE_CHAT_ID!"
-        )
-
-    else:
-        du_lieu = scrape_data()
-
-        if du_lieu:
-
-            # ---------------------------------------------
-            # LỊCH HỌC
-            # ---------------------------------------------
-            if du_lieu.get(
-                "anh_lich_hoc"
-            ):
-                send_telegram_photo(
-                    du_lieu[
-                        "anh_lich_hoc"
-                    ],
-                    "📌 Lịch học tuần này",
-                    bot_token,
-                    chat_id
-                )
-
-            elif du_lieu.get(
-                "tin_nhan_lich_hoc"
-            ):
-                send_telegram_message(
-                    du_lieu[
-                        "tin_nhan_lich_hoc"
-                    ],
-                    bot_token,
-                    chat_id
-                )
-
-            # ---------------------------------------------
-            # LỊCH THI
-            # ---------------------------------------------
-            if du_lieu.get(
-                "anh_lich_thi"
-            ):
-                send_telegram_photo(
-                    du_lieu[
-                        "anh_lich_thi"
-                    ],
-                    "🚨 ĐÃ CÓ LỊCH THI MỚI",
-                    bot_token,
-                    chat_id
-                )
-
-            # ---------------------------------------------
-            # HỌC PHÍ
-            # ---------------------------------------------
-            if du_lieu.get(
-                "anh_hoc_phi"
-            ):
-                send_telegram_photo(
-                    du_lieu[
-                        "anh_hoc_phi"
-                    ],
-                    du_lieu[
-                        "tin_nhan_hoc_phi"
-                    ],
-                    bot_token,
-                    chat_id
-                )
+    sys.exit(main())
