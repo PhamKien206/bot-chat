@@ -1,7 +1,15 @@
 """
 Bot Telegram báo Lịch học / Lịch thi / Học phí từ cổng sinh viên TLU.
 
-Chạy bởi GitHub Actions mỗi sáng thứ Hai (xem .github/workflows/run_bot.yml).
+Chạy bởi GitHub Actions mỗi sáng (xem .github/workflows/run_bot.yml):
+    python bot_telegram.py tuan   Thứ Hai: quét lịch học + lịch thi + học phí, lưu lịch cả tuần,
+                                  rồi báo lịch hôm nay.
+    python bot_telegram.py ngay   Các ngày khác: đọc lịch đã lưu, báo hôm nay học gì / nghỉ.
+                                  Không mở trình duyệt.
+    python bot_telegram.py hoc    Dự phòng khi chưa có lịch tuần đã lưu: chỉ quét lịch học.
+    python bot_telegram.py auto   Tự chọn 1 trong 3 chế độ trên (mặc định).
+    python bot_telegram.py --che-do   Chỉ in chế độ sẽ chạy (workflow dùng để quyết định
+                                      có cần cài trình duyệt hay không).
 
 Biến môi trường cần có:
     TELE_BOT_TOKEN, TELE_CHAT_ID, MSV, PASS_TRUONG
@@ -21,8 +29,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import TimeoutError as PWTimeout
-from playwright.sync_api import sync_playwright
+
+try:
+    from playwright.sync_api import TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
+except ImportError:   # chế độ "ngay" không cần cài Playwright
+    PWTimeout = sync_playwright = None
 
 
 # =========================================================
@@ -109,6 +121,102 @@ def cac_ngay_trong(text):
     return ket_qua
 
 
+# "T2", "Thứ 2", "Thứ hai", "CN", "Chủ nhật" -> 0..6 (thứ Hai = 0)
+_THU_CHU = {"hai": 0, "ba": 1, "tư": 2, "tu": 2, "năm": 3, "nam": 3, "sáu": 4, "sau": 4, "bảy": 5, "bay": 5}
+
+
+def thu_cua_cot(tieu_de):
+    t = (tieu_de or "").strip().lower()
+    if re.match(r"^(cn|chủ\s*nhật|chu\s*nhat)\b", t):
+        return 6
+    m = re.match(r"^(?:t|thứ|thu)\s*\.?\s*([2-7])\b", t)
+    if m:
+        return int(m.group(1)) - 2
+    m = re.match(r"^(?:thứ|thu)\s+(\w+)", t)
+    if m and m.group(1) in _THU_CHU:
+        return _THU_CHU[m.group(1)]
+    return None
+
+
+def lam_gon(text):
+    """Gộp khoảng trắng, bỏ dòng trống."""
+    dong = [re.sub(r"\s+", " ", d).strip() for d in (text or "").splitlines()]
+    return "\n".join(d for d in dong if d)
+
+
+def phan_tich_lich_tuan(bang, dau_tuan):
+    """
+    Bảng (tieu_de + luoi) -> {"YYYY-MM-DD": [{"ca": ..., "mon": ...}, ...]} cho 7 ngày trong tuần.
+
+    - Cột ngày nhận ra theo tiêu đề (T2..CN / Thứ 2.. / Chủ nhật). Không nhận ra được thì
+      coi 7 cột cuối là thứ Hai..Chủ nhật.
+    - Các cột còn lại (Ca / Buổi / Tiết...) ghép thành nhãn của hàng.
+    - Một môn kéo dài nhiều hàng liền nhau (lặp nội dung) được gộp làm một.
+    """
+    tieu_de = bang.get("tieu_de") or []
+    luoi = bang.get("luoi") or []
+    so_cot = max((len(h) for h in luoi), default=0)
+
+    cot_thu = {i: thu_cua_cot(t) for i, t in enumerate(tieu_de)}
+    cot_thu = {i: d for i, d in cot_thu.items() if d is not None}
+    if len(cot_thu) < 5 and so_cot >= 7:
+        cot_thu = {so_cot - 7 + k: k for k in range(7)}
+    cot_nhan = [i for i in range(so_cot) if i not in cot_thu]
+
+    lich = {(dau_tuan + timedelta(days=k)).isoformat(): [] for k in range(7)}
+    nhan_cu = {}
+    cuoi = {}   # thứ -> (chỉ số hàng, mục) của môn gần nhất, để gộp hàng liền nhau
+    for r, hang in enumerate(luoi):
+        phan = []
+        for c in cot_nhan:
+            o = hang[c] if c < len(hang) else ""
+            if o is None:            # ô nhãn bị kéo dài từ hàng trên
+                o = nhan_cu.get(c, "")
+            nhan_cu[c] = o
+            if o:
+                phan.append(lam_gon(o).replace("\n", " "))
+        nhan = " · ".join(phan)
+        nhan_cuoi = phan[-1] if phan else ""   # vd "Tiết 3" (bỏ "Sáng ·" lặp lại)
+
+        for c, thu in cot_thu.items():
+            o = hang[c] if c < len(hang) else ""
+            truoc = cuoi.get(thu)
+            noi_tiep = truoc and truoc[0] == r - 1
+            # Môn kéo dài xuống hàng này: ô gộp (None) hoặc lặp đúng nội dung hàng trên.
+            if noi_tiep and (o is None or (o and lam_gon(o) == truoc[1]["mon"])):
+                dau = truoc[1]["ca"].split(" → ")[0]
+                if nhan_cuoi and nhan_cuoi != dau:
+                    truoc[1]["ca"] = f"{dau} → {nhan_cuoi}"
+                cuoi[thu] = (r, truoc[1])
+                continue
+            if not o:
+                continue
+            mon = lam_gon(o)
+            ngay = (dau_tuan + timedelta(days=thu)).isoformat()
+            muc = {"ca": nhan, "mon": mon}
+            lich[ngay].append(muc)
+            cuoi[thu] = (r, muc)
+    return lich
+
+
+TEN_THU = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
+
+
+def tin_lich_hom_nay(lich_tuan, ngay):
+    """Tin nhắn báo lịch học của ngày `ngay` từ lịch tuần đã lưu."""
+    tieu_de = f"{TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}"
+    if lich_tuan.get("ngay") is None:
+        return None   # không đọc được chi tiết -> nơi gọi gửi ảnh lịch tuần
+    cac_mon = lich_tuan["ngay"].get(ngay.isoformat(), [])
+    if not cac_mon:
+        return f"😴 {tieu_de}\nHôm nay không có lịch học. Nghỉ!"
+    phan = [f"☀️ {tieu_de}", f"📚 Hôm nay có {len(cac_mon)} buổi học:"]
+    for m in cac_mon:
+        dau = f"🕘 {m['ca']}\n" if m.get("ca") else ""
+        phan.append(f"{dau}{m['mon']}")
+    return "\n\n".join(phan)
+
+
 def hom_nay():
     return datetime.now(VN_TZ).date()
 
@@ -153,6 +261,33 @@ JS_BANG_CO_MON = f"""sel => {{
     return [...t.querySelectorAll('tbody tr')].some(tr =>
         [...tr.querySelectorAll('td')].slice(1).some(td => td.innerText.trim() !== '')
     );
+}}"""
+
+
+# Đọc bảng lịch học thành lưới ô (đã xử lý rowspan/colspan).
+# Ô bị ô phía trên/bên trái kéo dài vào được đánh dấu null để không lặp môn.
+JS_DOC_BANG = f"""sel => {{
+    const t = ({_JS_TIM})(sel);
+    if (!t) return null;
+    const hang_tieu_de = t.querySelector('thead tr:last-child');
+    const tieu_de = hang_tieu_de
+        ? [...hang_tieu_de.children].flatMap(c => Array(c.colSpan || 1).fill(c.innerText.trim()))
+        : [];
+    const luoi = [];
+    [...t.querySelectorAll('tbody tr')].forEach((tr, r) => {{
+        luoi[r] = luoi[r] || [];
+        let c = 0;
+        for (const td of tr.children) {{
+            while (luoi[r][c] !== undefined) c++;
+            const rs = td.rowSpan || 1, cs = td.colSpan || 1, text = td.innerText.trim();
+            for (let i = 0; i < rs; i++) for (let j = 0; j < cs; j++) {{
+                luoi[r + i] = luoi[r + i] || [];
+                luoi[r + i][c + j] = (i === 0 && j === 0) ? text : null;
+            }}
+            c += cs;
+        }}
+    }});
+    return {{tieu_de, luoi: luoi.map(h => Array.from(h, x => x === undefined ? '' : x))}};
 }}"""
 
 
@@ -388,7 +523,9 @@ def dang_nhap(page, msv, password):
 def cao_lich_hoc(page):
     """
     Chỉ xử lý ĐÚNG tuần chứa hôm nay (giờ VN).
-    Trả về {"anh": path} nếu tuần này có lịch, {"tin": "..."} nếu được nghỉ.
+    Trả về:
+        {"tuan": "YYYY-MM-DD" (thứ Hai), "ngay": {ngày: [môn...]}, "anh": path}  có lịch
+        {"tuan": ..., "ngay": {}, "tin": "..."}                                   cả tuần nghỉ
     """
     log("📅 Lịch học...")
     mo_trang(page, URL_LICH_HOC)
@@ -401,7 +538,11 @@ def cao_lich_hoc(page):
     dau_tuan = ngay - timedelta(days=ngay.weekday())
     cuoi_tuan = dau_tuan + timedelta(days=6)
     khoang = f"({dau_tuan:%d/%m} - {cuoi_tuan:%d/%m})"
-    nghi = {"tin": f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!"}
+    nghi = {
+        "tuan": dau_tuan.isoformat(),
+        "ngay": {},
+        "tin": f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!",
+    }
 
     dropdown_tuan = (
         page.locator("label").filter(has_text="Tuần")
@@ -442,9 +583,18 @@ def cao_lich_hoc(page):
     if not co_mon:
         return nghi
 
+    bang = page.evaluate(JS_DOC_BANG, CSS_BANG_LICH_HOC)
+    lich = phan_tich_lich_tuan(bang or {}, dau_tuan)
+    so_buoi = sum(len(v) for v in lich.values())
+    if so_buoi == 0:
+        # Bảng có môn nhưng không tách được theo ngày: KHÔNG lưu là "nghỉ".
+        # Các ngày sau bot sẽ gửi lại ảnh lịch tuần thay vì tin chữ.
+        log("⚠️ Không tách được lịch theo ngày, sẽ dùng ảnh lịch tuần.")
+        lich = None
+
     path = chup(page.locator(f"{CSS_BANG_LICH_HOC}:visible").first, "anh_lich_hoc.png")
-    log("✅ Đã chụp lịch học tuần này")
-    return {"anh": path}
+    log(f"✅ Đã chụp và đọc lịch học tuần này ({so_buoi} buổi)")
+    return {"tuan": dau_tuan.isoformat(), "ngay": lich, "anh": path}
 
 
 # =========================================================
@@ -567,7 +717,7 @@ def chay_muc(page, khoa, ten, ham):
     raise RuntimeError(f"{ten}: {ngan_gon(loi)}") from loi
 
 
-def scrape_mot_lan(msv, password):
+def scrape_mot_lan(msv, password, cac_muc):
     global _mang
     ket_qua = {"loi": []}
 
@@ -593,7 +743,7 @@ def scrape_mot_lan(msv, password):
 
             # Mỗi mục độc lập: một mục hỏng không làm mất kết quả của mục khác,
             # cũng không phải đăng nhập lại từ đầu.
-            for khoa, ten, ham in CAC_MUC:
+            for khoa, ten, ham in cac_muc:
                 try:
                     ket_qua[khoa] = chay_muc(page, khoa, ten, ham)
                 except Exception as e:
@@ -605,13 +755,13 @@ def scrape_mot_lan(msv, password):
     return ket_qua
 
 
-def scrape_data(msv, password):
+def scrape_data(msv, password, cac_muc=CAC_MUC):
     """Retry cả phiên chỉ khi lỗi ở mức trình duyệt/đăng nhập. Sai mật khẩu thì dừng ngay."""
     loi = None
     for i in range(1, MAX_RETRY_SCRAPE + 1):
         log(f"\n===== PHIÊN {i}/{MAX_RETRY_SCRAPE} =====")
         try:
-            return scrape_mot_lan(msv, password)
+            return scrape_mot_lan(msv, password, cac_muc)
         except LoiDangNhap:
             raise
         except Exception as e:
@@ -690,10 +840,76 @@ class Telegram:
 
 
 # =========================================================
+# CHẾ ĐỘ CHẠY
+# =========================================================
+
+CAC_CHE_DO = ("tuan", "ngay", "hoc")
+ANH_LICH_TUAN = "lich_tuan.png"   # ảnh lịch tuần lưu trong STATE_DIR
+
+
+def dau_tuan_cua(ngay):
+    return ngay - timedelta(days=ngay.weekday())
+
+
+def co_lich_tuan_nay(state, ngay):
+    return (state.get("lich_tuan") or {}).get("tuan") == dau_tuan_cua(ngay).isoformat()
+
+
+def chon_che_do(yeu_cau, state, ngay):
+    """
+    tuan: thứ Hai (hoặc khi bấm chạy tay chọn tuan)
+    ngay: đã có lịch tuần này được lưu -> chỉ đọc và báo
+    hoc : chưa có lịch tuần này (thứ Hai lỗi / cache bị xóa) -> quét riêng lịch học
+    """
+    if yeu_cau in CAC_CHE_DO:
+        return yeu_cau
+    if ngay.weekday() == 0:
+        return "tuan"
+    return "ngay" if co_lich_tuan_nay(state, ngay) else "hoc"
+
+
+def bao_lich_hom_nay(tg, state, ngay):
+    lich_tuan = state.get("lich_tuan") or {}
+    tin = tin_lich_hom_nay(lich_tuan, ngay)
+    if tin is not None:
+        return tg.tin(tin)
+    anh = STATE_DIR / ANH_LICH_TUAN
+    if anh.exists():
+        return tg.anh(str(anh), f"📌 {TEN_THU[ngay.weekday()]} {ngay:%d/%m}: xem lịch hôm nay trong ảnh tuần")
+    return tg.tin(f"⚠️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m}: không đọc được lịch hôm nay.")
+
+
+def luu_lich_tuan(state, lh):
+    state["lich_tuan"] = {"tuan": lh["tuan"], "ngay": lh["ngay"]}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    anh = STATE_DIR / ANH_LICH_TUAN
+    if lh.get("anh"):
+        anh.write_bytes(Path(lh["anh"]).read_bytes())
+    elif anh.exists():
+        anh.unlink()
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
-def main():
+def main(argv):
+    ngay = hom_nay()
+    state = doc_state()
+    yeu_cau = next((a for a in argv if not a.startswith("-")), "auto")
+    che_do = chon_che_do(yeu_cau, state, ngay)
+
+    if "--che-do" in argv:
+        # Workflow dùng để biết có cần cài Playwright + Chromium không.
+        print(che_do)
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(f"che_do={che_do}\n")
+        return 0
+
+    log(f"🗓️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y} - chế độ: {che_do}")
+
     token = os.environ.get("TELE_BOT_TOKEN")
     chat_id = os.environ.get("TELE_CHAT_ID")
     if not token or not chat_id:
@@ -704,32 +920,48 @@ def main():
     link = link_lan_chay()
     duoi = f"\nXem log: {link}" if link else ""
 
+    # ---- Chế độ ngày: không cần trình duyệt
+    if che_do == "ngay":
+        return 0 if bao_lich_hom_nay(tg, state, ngay) else 1
+
+    if sync_playwright is None:
+        log("❌ Chưa cài Playwright mà chế độ này cần trình duyệt")
+        return 1
+
     msv = os.environ.get("MSV")
     password = os.environ.get("PASS_TRUONG")
     if not msv or not password:
         tg.tin("❌ Bot lịch học: thiếu secret MSV hoặc PASS_TRUONG." + duoi)
         return 1
 
+    cac_muc = CAC_MUC if che_do == "tuan" else CAC_MUC[:1]
     try:
-        kq = scrape_data(msv, password)
+        kq = scrape_data(msv, password, cac_muc)
     except Exception as e:
         if isinstance(e, LoiDangNhap):
             tg.tin(f"❌ Bot lịch học: {e} Hãy cập nhật secret PASS_TRUONG.")
         else:
-            tg.tin(f"❌ Bot lịch học không lấy được dữ liệu tuần này.\n{ngan_gon(e)}{duoi}")
+            tg.tin(f"❌ Bot lịch học không lấy được dữ liệu.\n{ngan_gon(e)}{duoi}")
         if Path("debug_dang_nhap.png").exists():
             tg.anh("debug_dang_nhap.png", "Ảnh màn hình lúc lỗi")
         return 1
 
-    # ---- Lịch học
+    # ---- Lịch học: lưu cả tuần, gửi ảnh tuần (thứ Hai) + lịch hôm nay
     lh = kq.get("lich_hoc")
-    if lh and lh.get("anh"):
-        tg.anh(lh["anh"], "📌 Lịch học tuần này")
-    elif lh and lh.get("tin"):
-        tg.tin(lh["tin"])
+    if lh:
+        luu_lich_tuan(state, lh)
+        ghi_state(state)
+        if lh.get("anh"):
+            if che_do == "tuan":
+                tg.anh(lh["anh"], "📌 Lịch học tuần này")
+            if lh["ngay"] is not None or che_do != "tuan":
+                bao_lich_hom_nay(tg, state, ngay)   # (đã gửi ảnh tuần thì khỏi gửi lại)
+        elif che_do == "tuan":
+            tg.tin(lh["tin"])               # cả tuần nghỉ: 1 tin là đủ
+        else:
+            bao_lich_hom_nay(tg, state, ngay)
 
     # ---- Lịch thi (báo rõ là mới hay chỉ nhắc lại)
-    state = doc_state()
     lt = kq.get("lich_thi")
     if lt:
         moi = lt["hash"] != state.get("lich_thi_hash")
@@ -760,4 +992,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
