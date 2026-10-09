@@ -53,7 +53,7 @@ VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 TIMEOUT_NAV = 60_000
 TIMEOUT_ELEMENT = 30_000
 TIMEOUT_CLICK = 12_000
-TIMEOUT_DOI_NOI_DUNG = 10_000   # chờ bảng đổi sau khi chọn dropdown
+TIMEOUT_DOI_NOI_DUNG = 25_000   # chờ bảng đổi sau khi chọn dropdown (web chậm)
 TIMEOUT_HOC_PHI = 15_000        # chờ ô tiền nợ (không có = không nợ)
 
 # Retry
@@ -361,6 +361,11 @@ def cho_bang_cap_nhat(page, css, noi_dung_cu, so_request_truoc):
                 if not co_request and time.monotonic() - bat_dau > 1.5:
                     break
         page.wait_for_timeout(100)
+    else:
+        # Hết giờ: nếu web vẫn đang tải dữ liệu thì bảng trên màn hình là bảng CŨ.
+        # Báo lỗi để thử lại, tuyệt đối không đọc/chụp bảng chưa cập nhật.
+        if _mang is not None and _mang.dang_cho > 0:
+            raise RuntimeError("Web trường phản hồi quá chậm, bảng chưa cập nhật.")
     cho_text_on_dinh(page, css)
 
 
