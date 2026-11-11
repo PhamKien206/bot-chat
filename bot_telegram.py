@@ -4,12 +4,17 @@ Bot Telegram báo Lịch học / Lịch thi / Học phí từ cổng sinh viên 
 Gọi thẳng API của web trường (đúng các request mà trang web tự gọi), không cần trình duyệt:
 mỗi lần chạy chỉ vài giây.
 
-Chạy bởi GitHub Actions mỗi sáng (xem .github/workflows/run_bot.yml):
+Chạy bởi GitHub Actions mỗi ngày (xem .github/workflows/run_bot.yml):
     python bot_telegram.py         Tự chọn: thứ Hai gửi thêm tổng quan cả tuần.
     python bot_telegram.py tuan    Ép gửi bản thứ Hai (tổng quan tuần + nhắc học phí).
     python bot_telegram.py ngay    Ép gửi bản ngày thường.
+Tham số thứ hai (tùy chọn) chọn NGÀY ĐƯỢC BÁO:
+    auto (mặc định)   chạy từ 12h trưa trở đi -> báo lịch NGÀY MAI; chạy buổi sáng -> báo lịch HÔM NAY.
+    homnay / ngaymai  ép báo hôm nay / ngày mai.
+Nhờ vậy muốn đổi giờ gửi chỉ cần sửa dòng cron, bot tự báo đúng ngày.
+(Web trường đóng lúc rạng sáng nên nên chạy buổi tối hôm trước.)
 
-Mỗi sáng bot gửi:
+Mỗi lần chạy bot gửi (với "ngày được báo" là hôm nay hoặc ngày mai như trên):
     - 🖼️ Ảnh thời khóa biểu cả tuần dạng bảng (cột Thứ Hai..Chủ Nhật, hàng Tiết 1..15),
       cột hôm nay được tô nổi.
     - Lịch học hôm nay (hoặc báo nghỉ), kèm môn thi hôm nay nếu có.
@@ -74,6 +79,7 @@ SO_LUONG_SONG_SONG = 6
 STATE_DIR = Path(os.environ.get("BOT_STATE_DIR", ".bot_state"))
 STATE_FILE = STATE_DIR / "state.json"
 
+GIO_BAO_NGAY_MAI = 12       # chạy từ giờ này (giờ VN) trở đi thì báo lịch của ngày mai
 TEN_THU = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
 
 # Giờ các tiết học của trường (hàng của bảng thời khóa biểu).
@@ -478,18 +484,20 @@ def tin_hoc_phi(hp, tieu_de):
 # TIN NHẮN LỊCH
 # =========================================================
 
-def tin_hom_nay(buoi, thi, ngay):
+def tin_hom_nay(buoi, thi, ngay, nhan="hôm nay"):
+    """Lịch của `ngay`; `nhan` = "hôm nay" hoặc "ngày mai" (cách gọi ngày đó trong tin)."""
+    Nhan = nhan.capitalize()
     tieu_de = f"{TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}"
     hoc = buoi_trong_ngay(buoi, ngay)
     thi_nay = sorted((t for t in thi if t["ngay"] == ngay.isoformat()), key=lambda t: t["bat_dau"])
     phan = []
 
     if thi_nay:
-        phan.append(f"🚨 HÔM NAY THI {len(thi_nay)} MÔN:")
+        phan.append(f"🚨 {nhan.upper()} THI {len(thi_nay)} MÔN:")
         phan += [dong_thi(t, kem_ngay=False) for t in thi_nay]
 
     if hoc:
-        phan.append(f"☀️ {tieu_de} - hôm nay có {len(hoc)} buổi học:")
+        phan.append(f"{'☀️' if nhan == 'hôm nay' else '🌙'} {tieu_de} - {nhan} có {len(hoc)} buổi học:")
         for b in hoc:
             dong = [f"🕐 {b['bat_dau']}–{b['ket_thuc']}" + (f" (tiết {b['tiet']})" if b["tiet"] else ""),
                     f"📘 {_ten_mon(b)}"]
@@ -501,7 +509,7 @@ def tin_hom_nay(buoi, thi, ngay):
     elif thi_nay:
         phan.append(f"📚 {tieu_de}: không có lịch học.")
     else:
-        phan.append(f"😴 {tieu_de}\nHôm nay không có lịch học. Nghỉ!")
+        phan.append(f"😴 {tieu_de}\n{Nhan} không có lịch học. Nghỉ!")
     return "\n\n".join(phan)
 
 
@@ -586,7 +594,7 @@ def _xuong_dong(ve, text, font, rong, toi_da):
     return dong
 
 
-def ve_lich_tuan(buoi, ngay):
+def ve_lich_tuan(buoi, ngay, nhan="hôm nay"):
     """
     Vẽ thời khóa biểu của tuần chứa `ngay` thành ảnh PNG (bytes):
     cột = Thứ Hai..Chủ Nhật, hàng = Tiết 1..15, mỗi ô ghi tên môn (xanh) + phòng (đỏ).
@@ -644,7 +652,7 @@ def ve_lich_tuan(buoi, ngay):
     for k in range(7):
         d = dau_tuan + timedelta(days=k)
         ve.text((x_cot(k) + 10, y0 + 12), TEN_THU[k], font=f_dau, fill=CHU)
-        ve.text((x_cot(k) + 10, y0 + 42), f"{d:%d/%m}" + ("  (hôm nay)" if k == hom_nay_k else ""),
+        ve.text((x_cot(k) + 10, y0 + 42), f"{d:%d/%m}" + (f"  ({nhan})" if k == hom_nay_k else ""),
                 font=f_ngay, fill=CHU if k == hom_nay_k else CHU_MO)
 
     # cột tiết + các ô
@@ -839,10 +847,14 @@ class Telegram:
 # =========================================================
 
 def main(argv):
-    ngay = hom_nay()
     yeu_cau = argv[0] if argv else "auto"
+    ngay_bao = argv[1] if len(argv) > 1 else "auto"
+    # "ngay" = NGÀY ĐƯỢC BÁO: chạy buổi tối thì báo trước lịch ngày mai, chạy buổi sáng thì báo hôm nay.
+    bao_mai = ngay_bao == "ngaymai" or (ngay_bao != "homnay" and datetime.now(VN_TZ).hour >= GIO_BAO_NGAY_MAI)
+    ngay = hom_nay() + timedelta(days=1 if bao_mai else 0)
+    nhan = "ngày mai" if bao_mai else "hôm nay"
     thu_hai = yeu_cau == "tuan" or (yeu_cau != "ngay" and ngay.weekday() == 0)
-    log(f"🗓️ {TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}" + (" (bản thứ Hai)" if thu_hai else ""))
+    log(f"🗓️ Báo lịch {nhan}: {TEN_THU[ngay.weekday()]} {ngay:%d/%m/%Y}" + (" (bản thứ Hai)" if thu_hai else ""))
 
     token = os.environ.get("TELE_BOT_TOKEN")
     chat_id = os.environ.get("TELE_CHAT_ID")
@@ -910,13 +922,13 @@ def main(argv):
         luc = datetime.fromisoformat(state["lich_hoc"]["luc"])
         ghi_chu = f"\n\n⚠️ Web trường đang lỗi, lịch lấy từ bản lưu lúc {luc:%H:%M %d/%m}."
 
-    # ---- 1. Ảnh thời khóa biểu cả tuần (mỗi ngày, cột hôm nay tô nổi).
+    # ---- 1. Ảnh thời khóa biểu cả tuần (mỗi ngày, cột của ngày được báo tô nổi).
     #         Không vẽ/gửi được ảnh thì thứ Hai gửi bản chữ như cũ.
     if buoi is not None:
         da_gui_anh = False
         try:
             dau_tuan = ngay - timedelta(days=ngay.weekday())
-            da_gui_anh = tg.anh(ve_lich_tuan(buoi, ngay),
+            da_gui_anh = tg.anh(ve_lich_tuan(buoi, ngay, nhan),
                                 f"📅 Lịch học tuần {dau_tuan:%d/%m} – {dau_tuan + timedelta(days=6):%d/%m}")
         except Exception as e:
             log(f"⚠️ Không vẽ được ảnh lịch tuần: {ngan_gon(e)}")
@@ -927,9 +939,9 @@ def main(argv):
             if thi_sap_toi:
                 tg.tin(thi_sap_toi)
 
-    # ---- 2. Lịch hôm nay (kèm môn thi hôm nay)
+    # ---- 2. Lịch của ngày được báo (kèm môn thi ngày đó)
     if buoi is not None:
-        tg.tin(tin_hom_nay(buoi, thi or [], ngay) + ghi_chu)
+        tg.tin(tin_hom_nay(buoi, thi or [], ngay, nhan) + ghi_chu)
 
     # ---- 3. Lịch thi mới / thay đổi / bị gỡ (so với lần đã báo trước)
     if thi_moi:
@@ -957,11 +969,12 @@ def main(argv):
                    if i not in hien_tai and c.get("nguon") not in thi_ok and con_lien_quan(c, ngay)}
             state["thi_da_bao"] = {**giu, **hien_tai}
 
-    # ---- 4. Nhắc thi ngày mai
+    # ---- 4. Nhắc trước thi của ngày kế sau ngày được báo
     mai = (ngay + timedelta(days=1)).isoformat()
     thi_mai = [t for t in (thi or []) if t["ngay"] == mai]
     if thi_mai:
-        tg.tin(f"⏰ NGÀY MAI THI {len(thi_mai)} MÔN:\n\n" + "\n\n".join(dong_thi(t) for t in thi_mai))
+        tg.tin(f"⏰ {'NGÀY KIA' if bao_mai else 'NGÀY MAI'} THI {len(thi_mai)} MÔN:\n\n"
+               + "\n\n".join(dong_thi(t) for t in thi_mai))
 
     # ---- 5. Học phí: báo khi số còn phải đóng thay đổi; thứ Hai nhắc lại nếu còn nợ
     if hp_moi:
