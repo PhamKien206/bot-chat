@@ -10,11 +10,13 @@ Chạy bởi GitHub Actions mỗi sáng (xem .github/workflows/run_bot.yml):
     python bot_telegram.py ngay    Ép gửi bản ngày thường.
 
 Mỗi sáng bot gửi:
+    - 🖼️ Ảnh thời khóa biểu cả tuần dạng bảng (cột Thứ Hai..Chủ Nhật, hàng Tiết 1..15),
+      cột hôm nay được tô nổi.
     - Lịch học hôm nay (hoặc báo nghỉ), kèm môn thi hôm nay nếu có.
     - 🚨 Lịch thi MỚI / THAY ĐỔI ngay khi trường đăng.
     - ⏰ Nhắc trước 1 ngày khi ngày mai có thi.
     - 💰 Học phí: báo khi số tiền còn phải đóng thay đổi; thứ Hai nhắc lại nếu còn nợ.
-    - Thứ Hai: thêm tổng quan lịch học cả tuần + các môn thi sắp tới.
+    - Thứ Hai: thêm danh sách các môn thi sắp tới (và lịch tuần dạng chữ nếu không vẽ được ảnh).
 
 Biến môi trường cần có:
     TELE_BOT_TOKEN, TELE_CHAT_ID, MSV, PASS_TRUONG
@@ -23,6 +25,7 @@ Tùy chọn:
     TLU_BASE_URL    đổi địa chỉ web (dùng khi test)
 """
 
+import io
 import json
 import os
 import re
@@ -72,6 +75,15 @@ STATE_DIR = Path(os.environ.get("BOT_STATE_DIR", ".bot_state"))
 STATE_FILE = STATE_DIR / "state.json"
 
 TEN_THU = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
+
+# Giờ các tiết học của trường (hàng của bảng thời khóa biểu).
+GIO_TIET = (
+    ("07:00", "07:50"), ("07:55", "08:45"), ("08:50", "09:40"), ("09:45", "10:35"), ("10:40", "11:30"),
+    ("11:35", "12:25"), ("12:55", "13:45"), ("13:50", "14:40"), ("14:45", "15:35"), ("15:40", "16:30"),
+    ("16:35", "17:25"), ("17:30", "18:20"), ("18:50", "19:40"), ("19:45", "20:35"), ("20:40", "21:30"),
+)
+# Font có dấu tiếng Việt: ưu tiên font kèm trong repo (thư mục fonts/), sau đó font của máy.
+THU_MUC_FONT = (Path(__file__).resolve().parent / "fonts", Path("/usr/share/fonts/truetype/dejavu"))
 
 
 class LoiDangNhap(Exception):
@@ -493,8 +505,8 @@ def tin_hom_nay(buoi, thi, ngay):
     return "\n\n".join(phan)
 
 
-def tin_tuan(buoi, thi, ngay):
-    """Tổng quan cả tuần (gửi sáng thứ Hai)."""
+def tin_tuan(buoi, ngay):
+    """Lịch cả tuần dạng chữ (chỉ dùng khi không vẽ/gửi được ảnh bảng)."""
     dau = ngay - timedelta(days=ngay.weekday())
     khoang = f"({dau:%d/%m} - {dau + timedelta(days=6):%d/%m})"
     dong, tong = [f"📅 Lịch học tuần này {khoang}"], 0
@@ -510,15 +522,163 @@ def tin_tuan(buoi, thi, ngay):
             dong.append(f"  • {b['bat_dau']} {_ten_mon(b)}{phong}")
     if tong == 0:
         dong = [f"🎉 Tuần này {khoang} không có lịch học nào. Nghỉ!"]
-
-    sap_toi = [t for t in thi if con_lien_quan(t, ngay)]
-    if sap_toi:
-        dong.append(f"\n\n📝 Lịch thi sắp tới ({len(sap_toi)} môn):")
-        for t in sap_toi:
-            ngay_t = f"{_d(t):%d/%m}" if t["ngay"] else "chưa rõ ngày"
-            gio = f" {t['bat_dau']}" if t["bat_dau"] else ""
-            dong.append(f"  • {ngay_t}{gio} {_ten_thi(t)}" + (f" · {t['phong']}" if t["phong"] else ""))
     return "\n".join(dong)
+
+
+def tin_thi_sap_toi(thi, ngay):
+    """Danh sách môn thi sắp tới (gửi sáng thứ Hai). Không có môn nào -> ""."""
+    sap_toi = [t for t in thi if con_lien_quan(t, ngay)]
+    if not sap_toi:
+        return ""
+    dong = [f"📝 Lịch thi sắp tới ({len(sap_toi)} môn):"]
+    for t in sap_toi:
+        ngay_t = f"{_d(t):%d/%m}" if t["ngay"] else "chưa rõ ngày"
+        gio = f" {t['bat_dau']}" if t["bat_dau"] else ""
+        dong.append(f"  • {ngay_t}{gio} {_ten_thi(t)}" + (f" · {t['phong']}" if t["phong"] else ""))
+    return "\n".join(dong)
+
+
+# =========================================================
+# ẢNH THỜI KHÓA BIỂU DẠNG BẢNG (giống trang web trường)
+# =========================================================
+
+def _khoang_tiet(b):
+    """Buổi học -> (tiết đầu, tiết cuối), đánh số từ 1. Không xác định được -> None."""
+    so = [int(x) for x in re.findall(r"\d+", b.get("tiet") or "")]
+    if so:
+        dau, cuoi = so[0], so[-1]
+    else:                                   # không có số tiết: suy ra từ giờ học
+        dau = next((i + 1 for i, g in enumerate(GIO_TIET) if g[0] <= b["bat_dau"] <= g[1]), None)
+        cuoi = next((i + 1 for i, g in enumerate(GIO_TIET) if g[0] <= b["ket_thuc"] <= g[1]), dau)
+        if dau is None:
+            return None
+    dau, cuoi = max(1, dau), min(len(GIO_TIET), cuoi)
+    return (dau, cuoi) if dau <= cuoi else None
+
+
+def _font(dam, co):
+    from PIL import ImageFont
+    ten = "DejaVuSans-Bold.ttf" if dam else "DejaVuSans.ttf"
+    for thu_muc in THU_MUC_FONT:
+        if (thu_muc / ten).exists():
+            return ImageFont.truetype(str(thu_muc / ten), co)
+    raise RuntimeError(f"Không tìm thấy font {ten}")
+
+
+def _xuong_dong(ve, text, font, rong, toi_da):
+    """Ngắt `text` thành tối đa `toi_da` dòng vừa bề rộng `rong` (dòng cuối quá dài thì thêm …)."""
+    dong, hien = [], ""
+    for tu in text.split():
+        thu = f"{hien} {tu}".strip()
+        if not hien or ve.textlength(thu, font=font) <= rong:
+            hien = thu
+        else:
+            dong.append(hien)
+            hien = tu
+    dong.append(hien)
+    if len(dong) > toi_da:
+        dong = dong[:toi_da - 1] + [" ".join(dong[toi_da - 1:])]
+    cuoi = dong[-1]
+    if ve.textlength(cuoi, font=font) > rong:
+        while cuoi and ve.textlength(cuoi + "…", font=font) > rong:
+            cuoi = cuoi[:-1]
+        dong[-1] = cuoi.rstrip() + "…"
+    return dong
+
+
+def ve_lich_tuan(buoi, ngay):
+    """
+    Vẽ thời khóa biểu của tuần chứa `ngay` thành ảnh PNG (bytes):
+    cột = Thứ Hai..Chủ Nhật, hàng = Tiết 1..15, mỗi ô ghi tên môn (xanh) + phòng (đỏ).
+    Cột của `ngay` được tô nổi.
+    """
+    from PIL import Image, ImageDraw
+
+    dau_tuan = ngay - timedelta(days=ngay.weekday())
+    so_tiet = len(GIO_TIET)
+    # o[(tiết, thứ)] = [(tên môn, phòng), ...]
+    o = {}
+    for k in range(7):
+        for b in buoi_trong_ngay(buoi, dau_tuan + timedelta(days=k)):
+            kt = _khoang_tiet(b)
+            if not kt:
+                continue
+            phong = " · ".join(x for x in (b["phong"], b.get("nhom")) if x)
+            for tiet in range(kt[0], kt[1] + 1):
+                o.setdefault((tiet, k), []).append((b["mon"], phong))
+
+    LE, R_TIET, R_COT = 24, 170, 206                 # lề, rộng cột "Tiết", rộng cột ngày
+    C_TIEU_DE, C_DAU, C_HANG = 70, 74, 92            # cao: tiêu đề, hàng tên thứ, mỗi hàng tiết
+    rong = LE * 2 + R_TIET + R_COT * 7
+    cao = LE + C_TIEU_DE + C_DAU + C_HANG * so_tiet + LE
+    x0, y0 = LE, LE + C_TIEU_DE                      # góc trên-trái của bảng
+
+    NEN, NEN_LE, KE = "#ffffff", "#f7f9fc", "#e3e8ef"
+    NEN_NAY, NEN_NAY_LE, DAU_NAY = "#fff8e1", "#fff3cd", "#ffe08a"
+    CHU, CHU_MO, XANH, DO = "#1f2933", "#6b7280", "#1a8fd1", "#e03131"
+
+    f_tieu_de, f_dau, f_ngay = _font(True, 28), _font(True, 20), _font(False, 17)
+    f_tiet, f_gio = _font(True, 18), _font(False, 15)
+    f_mon, f_phong = _font(True, 17), _font(True, 16)
+
+    anh = Image.new("RGB", (rong, cao), NEN)
+    ve = ImageDraw.Draw(anh)
+
+    ve.text((x0, LE + 8), f"Lịch học tuần {dau_tuan:%d/%m} – {dau_tuan + timedelta(days=6):%d/%m/%Y}",
+            font=f_tieu_de, fill=CHU)
+
+    def x_cot(k):
+        return x0 + R_TIET + R_COT * k
+
+    # nền các hàng (xen kẽ) + cột hôm nay
+    hom_nay_k = ngay.weekday()
+    for i in range(so_tiet):
+        y = y0 + C_DAU + C_HANG * i
+        if i % 2 == 0:
+            ve.rectangle((x0, y, rong - LE, y + C_HANG), fill=NEN_LE)
+        ve.rectangle((x_cot(hom_nay_k), y, x_cot(hom_nay_k + 1), y + C_HANG),
+                     fill=NEN_NAY_LE if i % 2 == 0 else NEN_NAY)
+    ve.rectangle((x_cot(hom_nay_k), y0, x_cot(hom_nay_k + 1), y0 + C_DAU), fill=DAU_NAY)
+
+    # hàng tiêu đề: tên thứ + ngày
+    for k in range(7):
+        d = dau_tuan + timedelta(days=k)
+        ve.text((x_cot(k) + 10, y0 + 12), TEN_THU[k], font=f_dau, fill=CHU)
+        ve.text((x_cot(k) + 10, y0 + 42), f"{d:%d/%m}" + ("  (hôm nay)" if k == hom_nay_k else ""),
+                font=f_ngay, fill=CHU if k == hom_nay_k else CHU_MO)
+
+    # cột tiết + các ô
+    for i, (bd, kt) in enumerate(GIO_TIET):
+        y = y0 + C_DAU + C_HANG * i
+        ve.text((x0 + 10, y + 20), f"Tiết {i + 1}", font=f_tiet, fill=CHU)
+        ve.text((x0 + 10, y + 48), f"({bd} → {kt})", font=f_gio, fill=CHU_MO)
+        for k in range(7):
+            ds = o.get((i + 1, k))
+            if not ds:
+                continue
+            mon = " / ".join(dict.fromkeys(m for m, _ in ds))
+            phong = " / ".join(dict.fromkeys(p for _, p in ds if p))
+            dong = _xuong_dong(ve, mon, f_mon, R_COT - 18, 2)
+            yy = y + (10 if len(dong) > 1 else 20)
+            for d in dong:
+                ve.text((x_cot(k) + 9, yy), d, font=f_mon, fill=XANH)
+                yy += 22
+            if phong:
+                ve.text((x_cot(k) + 9, yy + 2), _xuong_dong(ve, phong, f_phong, R_COT - 18, 1)[0],
+                        font=f_phong, fill=DO)
+
+    # đường kẻ
+    y_cuoi = y0 + C_DAU + C_HANG * so_tiet
+    for i in range(so_tiet + 1):
+        y = y0 + C_DAU + C_HANG * i
+        ve.line((x0, y, rong - LE, y), fill=KE, width=1)
+    for x in [x0] + [x_cot(k) for k in range(8)]:
+        ve.line((x, y0, x, y_cuoi), fill=KE, width=1)
+    ve.line((x0, y0, rong - LE, y0), fill=CHU, width=3)
+
+    buf = io.BytesIO()
+    anh.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 # =========================================================
@@ -669,6 +829,10 @@ class Telegram:
     def tin(self, text):
         return self._goi("sendMessage", {"text": text[:4096]})
 
+    def anh(self, png, chu_thich=""):
+        return self._goi("sendPhoto", {"caption": chu_thich[:1024]},
+                         files={"photo": ("lich_tuan.png", png, "image/png")})
+
 
 # =========================================================
 # MAIN
@@ -746,9 +910,22 @@ def main(argv):
         luc = datetime.fromisoformat(state["lich_hoc"]["luc"])
         ghi_chu = f"\n\n⚠️ Web trường đang lỗi, lịch lấy từ bản lưu lúc {luc:%H:%M %d/%m}."
 
-    # ---- 1. Tổng quan tuần (thứ Hai)
-    if thu_hai and buoi is not None:
-        tg.tin(tin_tuan(buoi, thi or [], ngay) + ghi_chu)
+    # ---- 1. Ảnh thời khóa biểu cả tuần (mỗi ngày, cột hôm nay tô nổi).
+    #         Không vẽ/gửi được ảnh thì thứ Hai gửi bản chữ như cũ.
+    if buoi is not None:
+        da_gui_anh = False
+        try:
+            dau_tuan = ngay - timedelta(days=ngay.weekday())
+            da_gui_anh = tg.anh(ve_lich_tuan(buoi, ngay),
+                                f"📅 Lịch học tuần {dau_tuan:%d/%m} – {dau_tuan + timedelta(days=6):%d/%m}")
+        except Exception as e:
+            log(f"⚠️ Không vẽ được ảnh lịch tuần: {ngan_gon(e)}")
+        if thu_hai:
+            if not da_gui_anh:
+                tg.tin(tin_tuan(buoi, ngay) + ghi_chu)
+            thi_sap_toi = tin_thi_sap_toi(thi or [], ngay)
+            if thi_sap_toi:
+                tg.tin(thi_sap_toi)
 
     # ---- 2. Lịch hôm nay (kèm môn thi hôm nay)
     if buoi is not None:
