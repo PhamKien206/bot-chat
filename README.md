@@ -7,7 +7,7 @@ It runs on **GitHub Actions** every day, so you don't need a server.
 The bot calls the portal's JSON API directly (the same requests the website makes), so it doesn't
 need a browser and each run finishes in a few seconds.
 
-![Weekly timetable sent to Telegram](docs/preview.png)
+
 
 ## Features
 
