@@ -4,7 +4,7 @@ on:
   schedule:
     # Mỗi ngày 22:47 UTC = 05:47 sáng giờ VN (hôm sau).
     # Tránh mốc tròn giờ vì GitHub hay trễ 10–30 phút lúc đó -> tin tới khoảng 6h.
-    - cron: '47 22 * * *'
+    - cron: '17 15 * * *'
   workflow_dispatch:
     inputs:
       che_do:
