@@ -23,6 +23,21 @@ tomorrow; when it runs in the morning, the target day is today.
 | 📝 **Upcoming exams list** | Mondays |
 | 💰 **Tuition fees**: the amount still owed | When the amount changes, plus a reminder every Monday while you still owe money |
 
+### Commands
+
+| Command | Reply |
+|---|---|
+| `/tracuudiem` | Cumulative GPA (4-point scale, from the portal; the bot calculates it itself if the portal doesn't return it), credits earned, failed courses still owed, and every semester's GPA with each course's coursework (QT), exam (Thi) and final mark, newest semester first |
+| `/help` | The list of commands |
+
+The bot only answers the chat in `TELE_CHAT_ID`, so nobody else who finds your bot can see your grades.
+
+The bot isn't running all the time, so the **Telegram Commands** workflow checks for new commands every 5 minutes
+(GitHub's minimum, and it often runs later than that). A reply can take 5 to 15 minutes. Telegram keeps
+unanswered messages for 24 hours, so a command you send while the bot is off still gets answered on the next run.
+For instant replies, run `python bot_telegram.py lenh` on a computer that stays on (and disable that workflow,
+because only one copy can listen at a time).
+
 If the portal is down, the bot sends the schedule saved from the last successful run and says so
 in the message. Errors are reported to the same chat with a link to the run log.
 
@@ -88,6 +103,7 @@ pip install -r requirements.txt
 export TELE_BOT_TOKEN=... TELE_CHAT_ID=... MSV=... PASS_TRUONG=...
 python bot_telegram.py                  # auto mode, auto target day
 python bot_telegram.py ngay ngaymai     # normal-day version, tomorrow's schedule
+python bot_telegram.py lenh             # answer commands like /tracuudiem (runs until Ctrl+C)
 ```
 
 Optional environment variables:
@@ -101,6 +117,7 @@ Optional environment variables:
 bot_telegram.py              The bot: portal API client, message and image builders, Telegram sender
 fonts/                       DejaVu Sans, so Vietnamese text renders correctly in the timetable image
 .github/workflows/run_bot.yml  Daily schedule and manual-run inputs
+.github/workflows/tra_cuu_diem.yml  Checks for commands (/tracuudiem) every 5 minutes
 docs/preview.png             The sample image above
 ```
 

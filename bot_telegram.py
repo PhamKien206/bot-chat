@@ -8,6 +8,9 @@ Chạy bởi GitHub Actions mỗi ngày (xem .github/workflows/run_bot.yml):
     python bot_telegram.py         Tự chọn: thứ Hai gửi thêm tổng quan cả tuần.
     python bot_telegram.py tuan    Ép gửi bản thứ Hai (tổng quan tuần + nhắc học phí).
     python bot_telegram.py ngay    Ép gửi bản ngày thường.
+    python bot_telegram.py lenh    Nghe lệnh Telegram (/tracuudiem: điểm từng môn + GPA) và trả lời.
+    python bot_telegram.py lenh 60 Trả lời các lệnh đang chờ, nghe thêm 60 giây rồi thoát
+                                   (GitHub Actions chạy cách này 5 phút/lần, xem tra_cuu_diem.yml).
 Tham số thứ hai (tùy chọn) chọn NGÀY ĐƯỢC BÁO:
     auto (mặc định)   chạy từ 12h trưa trở đi -> báo lịch NGÀY MAI; chạy buổi sáng -> báo lịch HÔM NAY.
     homnay / ngaymai  ép báo hôm nay / ngày mai.
@@ -60,6 +63,8 @@ API_DS_HOC_KY = f"{API}/api/semester/1/100"
 API_DOT = f"{API}/api/registerperiod/find/{{hk}}"
 API_LICH_THI = f"{API}/api/semestersubjectexamroom/getListRoomByStudentByLoginUser/{{hk}}/{{dot}}/{{lan}}"
 API_HOC_PHI = f"{API}/api/student/viewstudentpayablebyLoginUser"
+API_DIEM = f"{API}/api/studentsubjectmark/getListStudentMarkBySemesterByLoginUser/0"   # 0 = mọi học kỳ
+API_TONG_KET = f"{API}/api/studentsummarymark/getbystudent"                           # GPA web trường tính
 
 # client_id / client_secret là mã CHUNG của web trường (ai đăng nhập cũng gửi y hệt),
 # không phải thông tin bí mật của bạn.
@@ -481,6 +486,146 @@ def tin_hoc_phi(hp, tieu_de):
 
 
 # =========================================================
+# ĐIỂM (lệnh /tracuudiem)
+# =========================================================
+
+DIEM_CHU_HE_4 = {"A": 4.0, "B+": 3.5, "B": 3.0, "C+": 2.5, "C": 2.0, "D+": 1.5, "D": 1.0, "F": 0.0}
+GIOI_HAN_TIN = 4000         # Telegram cho tối đa 4096 ký tự / tin
+
+
+def _so(x):
+    try:
+        return None if x is None or x == "" else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _d10(x):
+    """7.5 -> '7.5', 8.0 -> '8', None -> '–'"""
+    return "–" if x is None else f"{x:.2f}".rstrip("0").rstrip(".")
+
+
+def tach_diem(ds):
+    """
+    JSON điểm từng môn -> danh sách gọn, mỗi phần tử:
+        ma, mon, tc (tín chỉ), tinh_gpa, qt (điểm quá trình), thi (điểm thi), tk (tổng kết hệ 10),
+        chu (điểm chữ), he4, lan_hoc, lan_thi, hk (tên học kỳ), hk_thu_tu (để sắp xếp)
+    """
+    ket_qua = []
+    for x in ds or []:
+        if not isinstance(x, dict):
+            continue
+        mon = x.get("subject") or {}
+        hk = x.get("semester") or {}
+        chu = (x.get("charMark") or "").strip().upper()
+        he4 = _so(x.get("mark4"))
+        if he4 is None and chu in DIEM_CHU_HE_4:
+            he4 = DIEM_CHU_HE_4[chu]
+        ket_qua.append({
+            "ma": mon.get("subjectCode") or x.get("subjectCode") or "",
+            "mon": mon.get("subjectName") or x.get("subjectName") or "?",
+            "tc": int(_so(mon.get("numberOfCredit")) or 0),
+            # GDTC, GDQP... có isCalculateMark = false: không tính vào GPA
+            "tinh_gpa": mon.get("isCalculateMark") is not False,
+            "qt": _so(x.get("markQT")),
+            "thi": _so(x.get("markTHI")),
+            "tk": _so(x.get("mark")),
+            "chu": chu,
+            "he4": he4 if chu else None,          # chưa có điểm chữ = chưa có điểm chính thức
+            "lan_hoc": x.get("studyTime"),
+            "lan_thi": x.get("examRound"),
+            "hk": hk.get("semesterName") or hk.get("semesterCode") or "Chưa rõ học kỳ",
+            "hk_thu_tu": (hk.get("startDate") or 0, hk.get("id") or 0, hk.get("semesterCode") or ""),
+        })
+    return ket_qua
+
+
+def gpa(cac_mon):
+    """(GPA hệ 4, số tín chỉ) của các môn có điểm và được tính GPA. Không có môn nào -> (None, 0)."""
+    tinh = [m for m in cac_mon if m["he4"] is not None and m["tinh_gpa"] and m["tc"] > 0]
+    tc = sum(m["tc"] for m in tinh)
+    return (sum(m["he4"] * m["tc"] for m in tinh) / tc, tc) if tc else (None, 0)
+
+
+def gpa_tich_luy(diem):
+    """Mỗi môn lấy lần điểm cao nhất (học lại/thi lại), bỏ môn F (chưa tích lũy)."""
+    tot_nhat = {}
+    for m in diem:
+        if m["he4"] is None:
+            continue
+        khoa = m["ma"] or m["mon"]
+        if khoa not in tot_nhat or m["he4"] > tot_nhat[khoa]["he4"]:
+            tot_nhat[khoa] = m
+    return gpa([m for m in tot_nhat.values() if m["chu"] != "F"])
+
+
+def _dong_mon(m):
+    ten = m["mon"]
+    if m["lan_hoc"] and int(m["lan_hoc"]) > 1:
+        ten += f" (học lại lần {m['lan_hoc']})"
+    elif m["lan_thi"] and int(m["lan_thi"]) > 1:
+        ten += f" (thi lại lần {m['lan_thi']})"
+    dau = f"• {ten} · {m['tc']}TC" + ("" if m["tinh_gpa"] else " · không tính GPA")
+    if m["chu"]:
+        ket = f"→ {_d10(m['tk'])} · {m['chu']}" + (f" ({_d10(m['he4'])})" if m["he4"] is not None else "")
+    else:
+        ket = "→ chưa có điểm tổng kết"
+    return f"{dau}\n   QT {_d10(m['qt'])} · Thi {_d10(m['thi'])} {ket}"
+
+
+def chia_tin(cac_khoi, gioi_han=GIOI_HAN_TIN):
+    """Ghép các khối chữ thành ít tin nhất có thể, mỗi tin không quá `gioi_han` ký tự."""
+    tin, hien = [], ""
+    for khoi in cac_khoi:
+        while len(khoi) > gioi_han:                 # khối quá dài (hiếm): cắt cứng
+            if hien:
+                tin.append(hien)
+                hien = ""
+            tin.append(khoi[:gioi_han])
+            khoi = khoi[gioi_han:]
+        if hien and len(hien) + 2 + len(khoi) > gioi_han:
+            tin.append(hien)
+            hien = khoi
+        else:
+            hien = f"{hien}\n\n{khoi}" if hien else khoi
+    if hien:
+        tin.append(hien)
+    return tin
+
+
+def tin_diem(diem, tong_ket=None):
+    """Danh sách tin nhắn: tổng quan GPA + điểm từng học kỳ (kỳ mới nhất trước)."""
+    tong_ket = tong_ket or {}
+    gpa_tl, tc_tl = gpa_tich_luy(diem)
+    gpa_web = _so(tong_ket.get("mark4"))
+    gpa_web10 = _so(tong_ket.get("mark"))
+
+    dau = ["📊 KẾT QUẢ HỌC TẬP"]
+    if gpa_web is not None:
+        dau.append(f"🎓 GPA tích lũy: {gpa_web:.2f}/4" + (f" · hệ 10: {gpa_web10:.2f}" if gpa_web10 is not None else ""))
+    elif gpa_tl is not None:
+        dau.append(f"🎓 GPA tích lũy: {gpa_tl:.2f}/4 (bot tự tính)")
+    if tc_tl:
+        dau.append(f"📚 Tín chỉ tích lũy: {tc_tl}")
+    no = sorted({m["mon"] for m in diem if m["chu"] == "F"}
+                - {m["mon"] for m in diem if m["chu"] and m["chu"] != "F"})
+    if no:
+        dau.append(f"⚠️ Còn nợ {len(no)} môn: " + ", ".join(no))
+    if not diem:
+        dau.append("Chưa có điểm môn nào trên web trường.")
+
+    theo_hk = {}
+    for m in diem:
+        theo_hk.setdefault((m["hk_thu_tu"], m["hk"]), []).append(m)
+    khoi = ["\n".join(dau)]
+    for (_, ten_hk), cac_mon in sorted(theo_hk.items(), key=lambda kv: kv[0][0], reverse=True):
+        g, tc = gpa(cac_mon)
+        tieu_de = f"📘 {ten_hk}" + (f" — GPA kỳ: {g:.2f} ({tc} TC)" if g is not None else "")
+        khoi.append("\n".join([tieu_de] + [_dong_mon(m) for m in sorted(cac_mon, key=lambda m: m["mon"])]))
+    return chia_tin(khoi)
+
+
+# =========================================================
 # TIN NHẮN LỊCH
 # =========================================================
 
@@ -783,6 +928,20 @@ def lay_hoc_phi(api):
     return hp
 
 
+def lay_diem(api):
+    """(điểm từng môn, bản tổng kết GPA của web trường). Bản tổng kết lỗi thì bot tự tính GPA."""
+    diem = tach_diem(api.get(API_DIEM))
+    tong_ket = {}
+    try:
+        tong_ket = api.get(API_TONG_KET)
+        if isinstance(tong_ket, list):
+            tong_ket = tong_ket[0] if tong_ket else {}
+    except Exception as e:
+        log(f"⚠️ Không lấy được GPA tổng kết của web trường, bot tự tính: {ngan_gon(e)}")
+    log(f"✅ Điểm: {len(diem)} môn")                 # không in điểm ra log public
+    return diem, tong_ket if isinstance(tong_ket, dict) else {}
+
+
 # =========================================================
 # TRẠNG THÁI GIỮA CÁC LẦN CHẠY
 # =========================================================
@@ -841,12 +1000,129 @@ class Telegram:
         return self._goi("sendPhoto", {"caption": chu_thich[:1024]},
                          files={"photo": ("lich_tuan.png", png, "image/png")})
 
+    def _an_token(self, loi):
+        """Thông báo lỗi của requests có cả URL (chứa token bot): che đi trước khi in log."""
+        return ngan_gon(loi).replace(self.base.rsplit("/bot", 1)[-1], "***")
+
+    def cap_nhat(self, offset, cho):
+        """Tin nhắn mới gửi tới bot (long polling `cho` giây). Lỗi -> None."""
+        data = {"timeout": cho, "allowed_updates": '["message"]'}
+        if offset is not None:
+            data["offset"] = offset          # xác nhận đã xử lý mọi update có id < offset
+        try:
+            r = self.session.post(f"{self.base}/getUpdates", data=data, timeout=cho + 15)
+            if r.ok:
+                return r.json().get("result") or []
+            if r.status_code == 409:
+                log("⚠️ Telegram 409: đang có một bản bot khác cũng nghe lệnh (chỉ nên chạy 1 bản).")
+            else:
+                log(f"⚠️ Telegram getUpdates lỗi {r.status_code}: {r.text[:200]}")
+        except requests.RequestException as e:
+            log(f"⚠️ Lỗi mạng Telegram: {self._an_token(e)}")
+        return None
+
+    def dat_menu_lenh(self, lenh):
+        """Hiện các lệnh trong menu "/" của Telegram."""
+        try:
+            self.session.post(f"{self.base}/setMyCommands", timeout=30, data={
+                "commands": json.dumps([{"command": k, "description": v} for k, v in lenh.items()],
+                                       ensure_ascii=False)})
+        except requests.RequestException as e:
+            log(f"⚠️ Không đặt được menu lệnh: {self._an_token(e)}")
+
+
+# =========================================================
+# NGHE LỆNH TỪ TELEGRAM (/tracuudiem ...)
+# =========================================================
+
+MENU_LENH = {
+    "tracuudiem": "Xem điểm các môn và GPA",
+    "help": "Các lệnh của bot",
+}
+CHO_TOI_DA = 50             # giây cho mỗi lần long polling
+
+
+def tra_cuu_diem(tg, msv, password):
+    try:
+        api = TluApi(msv, password)
+        api.dang_nhap()
+        diem, tong_ket = lay_diem(api)
+    except LoiDangNhap as e:
+        tg.tin(f"❌ {e} Hãy cập nhật secret PASS_TRUONG.")
+        return
+    except Exception as e:
+        tg.tin(f"❌ Không tra cứu được điểm (web trường đang lỗi?): {ngan_gon(e)}")
+        return
+    for tin in tin_diem(diem, tong_ket):
+        tg.tin(tin)
+
+
+def xu_ly_lenh(tg, lenh, msv, password):
+    log(f"📩 Lệnh /{lenh}")
+    if lenh == "tracuudiem":
+        tra_cuu_diem(tg, msv, password)
+    else:   # /start, /help và lệnh lạ
+        tg.tin("🤖 Các lệnh:\n" + "\n".join(f"/{k} - {v}" for k, v in MENU_LENH.items()))
+
+
+def nghe_lenh(tg, msv, password, so_giay=None):
+    """
+    Nhận và trả lời lệnh gửi tới bot.
+    so_giay = None: chạy mãi (máy tính/VPS). so_giay = N: xử lý lệnh đang chờ, nghe thêm N giây rồi
+    thoát (dùng cho GitHub Actions; Telegram giữ tin chưa xử lý 24 giờ nên lần chạy sau vẫn trả lời).
+    CHỈ trả lời đúng chat TELE_CHAT_ID: người lạ tìm thấy bot cũng không xem được điểm của bạn.
+    """
+    tg.dat_menu_lenh(MENU_LENH)
+    het_gio = None if so_giay is None else time.monotonic() + so_giay
+    offset = None
+    log("👂 Đang nghe lệnh" + (f" trong {so_giay}s" if so_giay is not None else " (Ctrl+C để dừng)"))
+    while True:
+        con_lai = CHO_TOI_DA if het_gio is None else int(het_gio - time.monotonic())
+        cap_nhat = tg.cap_nhat(offset, max(0, min(CHO_TOI_DA, con_lai)))
+        if cap_nhat is None:
+            time.sleep(5)
+            cap_nhat = []
+        lenh = []
+        for u in cap_nhat:
+            offset = u["update_id"] + 1
+            msg = u.get("message") or {}
+            if str((msg.get("chat") or {}).get("id")) != str(tg.chat_id):
+                log("🚫 Bỏ qua tin nhắn từ chat lạ")
+                continue
+            chu = (msg.get("text") or "").strip()
+            if chu.startswith("/"):
+                lenh.append(chu.split()[0][1:].split("@")[0].lower())   # "/tracuudiem@TenBot" -> "tracuudiem"
+        for ten in dict.fromkeys(lenh):      # bấm 1 lệnh nhiều lần lúc bot tắt -> chỉ trả lời 1 lần
+            xu_ly_lenh(tg, ten, msv, password)
+        if het_gio is not None and time.monotonic() >= het_gio:
+            break
+    if offset is not None:
+        tg.cap_nhat(offset, 0)               # xác nhận đã xử lý, lần chạy sau không trả lời lại
+    log("🏁 Xong!")
+    return 0
+
 
 # =========================================================
 # MAIN
 # =========================================================
 
+def chay_nghe_lenh(argv):
+    """python bot_telegram.py lenh [số giây]"""
+    token, chat_id = os.environ.get("TELE_BOT_TOKEN"), os.environ.get("TELE_CHAT_ID")
+    msv, password = os.environ.get("MSV"), os.environ.get("PASS_TRUONG")
+    if not all((token, chat_id, msv, password)):
+        log("❌ Thiếu TELE_BOT_TOKEN, TELE_CHAT_ID, MSV hoặc PASS_TRUONG")
+        return 1
+    so_giay = int(argv[0]) if argv else None
+    try:
+        return nghe_lenh(Telegram(token, chat_id), msv, password, so_giay)
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv):
+    if argv and argv[0] == "lenh":
+        return chay_nghe_lenh(argv[1:])
     yeu_cau = argv[0] if argv else "auto"
     ngay_bao = argv[1] if len(argv) > 1 else "auto"
     # "ngay" = NGÀY ĐƯỢC BÁO: chạy buổi tối thì báo trước lịch ngày mai, chạy buổi sáng thì báo hôm nay.
