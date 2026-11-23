@@ -1,0 +1,51 @@
+name: Telegram Commands (/tracuudiem)
+
+# Bot không chạy liên tục nên kiểm tra lệnh mới theo lịch.
+# 5 phút là mức nhỏ nhất GitHub cho phép (thực tế hay trễ hơn 5–15 phút).
+# Telegram giữ tin chưa xử lý 24 giờ nên lệnh gõ lúc nào cũng sẽ được trả lời ở lần chạy kế tiếp.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# Chỉ 1 bản nghe lệnh tại một thời điểm (2 bản cùng gọi getUpdates thì Telegram báo lỗi 409).
+concurrency:
+  group: telegram-lenh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  commands:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Cài thư viện
+        run: pip install -r requirements.txt
+
+      # Chỉ ĐỌC trạng thái (để dùng lại bộ chứng chỉ SSL), KHÔNG lưu lại:
+      # lưu thì có thể ghi đè trạng thái mới hơn của workflow báo lịch hằng ngày.
+      - name: Khôi phục trạng thái
+        uses: actions/cache/restore@v4
+        with:
+          path: .bot_state
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Trả lời lệnh
+        env:
+          TELE_BOT_TOKEN: ${{ secrets.TELE_BOT_TOKEN }}
+          TELE_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
+          MSV: ${{ secrets.MSV }}
+          PASS_TRUONG: ${{ secrets.PASS_TRUONG }}
+        # Trả lời các lệnh đang chờ, nghe thêm 60 giây rồi thoát.
+        run: python bot_telegram.py lenh 60
